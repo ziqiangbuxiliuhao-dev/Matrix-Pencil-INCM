@@ -1,1 +1,2975 @@
-After the editorial review is approved, it will proceed to the peer review stage for submission.
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
+import time
+from dataclasses import dataclass
+import cvxpy as cp      
+from scipy.optimize import minimize, Bounds
+# ============================================================
+# Global plotting style (journal)
+# ============================================================
+plt.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "mathtext.fontset": "dejavusans",
+    "axes.unicode_minus": False,
+
+    "font.size": 14,  # 全局基础字号
+    "axes.titlesize": 16,  # 标题
+    "axes.labelsize": 20,  # x/y轴标注
+    "xtick.labelsize": 16,  # x轴数字
+    "ytick.labelsize": 16,  # y轴数字
+    "legend.fontsize": 14,  # legend字号
+
+    "axes.linewidth": 0.9,
+    "xtick.major.width": 0.8,
+    "ytick.major.width": 0.8,
+    "xtick.minor.width": 0.6,
+    "ytick.minor.width": 0.6,
+    "xtick.major.size": 4,
+    "ytick.major.size": 4,
+
+    "grid.linewidth": 0.6,
+    "grid.alpha": 0.10,
+    "savefig.dpi": 500,
+    "figure.dpi": 140,
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+})
+
+LINEWIDTH_MAIN = 2.4
+LINEWIDTH_REF  = 1.4
+MARKERSIZE     = 5.2
+GRID_ALPHA     = 0.10
+def cov_atom(theta_deg, M):
+    a = steering_vector(theta_deg, M)
+    return a @ a.conj().T
+def residual_excluding_k(Rhat, support_deg, powers, sigma_n2_hat, k, M):
+    E = Rhat - sigma_n2_hat * np.eye(M, dtype=complex)
+    for j, (th, pw) in enumerate(zip(support_deg, powers)):
+        if j == k:
+            continue
+        E -= float(pw) * cov_atom(th, M)
+    return 0.5 * (E + E.conj().T)
+def single_angle_score(theta_deg, E, M):
+    a = steering_vector(theta_deg, M)
+    return np.real((a.conj().T @ E @ a).item())
+def local_peak_search(E, theta0, M, lo, hi, step_deg=0.2):
+    grid = np.arange(lo, hi + 0.5 * step_deg, step_deg)
+    vals = [single_angle_score(th, E, M) for th in grid]
+    return float(grid[np.argmax(vals)])
+def score_prime_fd(theta_deg, E, M, h=0.02):
+    return (single_angle_score(theta_deg + h, E, M) -
+            single_angle_score(theta_deg - h, E, M)) / (2*h)
+
+def score_hess_fd(theta_deg, E, M, h=0.02):
+    return (single_angle_score(theta_deg + h, E, M) -
+            2*single_angle_score(theta_deg, E, M) +
+            single_angle_score(theta_deg - h, E, M)) / (h*h)
+
+def newton_refine_single_angle(theta0, E, M, lo, hi, n_steps=2):
+    th = float(np.clip(theta0, lo, hi))
+    for _ in range(n_steps):
+        g = score_prime_fd(th, E, M)
+        H = score_hess_fd(th, E, M)
+        if abs(H) < 1e-8:
+            break
+        th_new = th - g / H
+        th = float(np.clip(th_new, lo, hi))
+    return th
+def refine_qh_angles_nomp(
+    Rhat,
+    init_support_deg,
+    desired_sector,
+    theta_s_bar,
+    sigma_n2_hat=None,
+    n_outer=2,
+    target_half_width_deg=2.0,
+    interf_half_width_deg=4.0,
+    coarse_step_deg=0.2,
+    newton_steps=2,
+    min_sep_deg=2.0,
+):
+    M = Rhat.shape[0]
+    support = np.asarray(init_support_deg, dtype=float).copy()
+
+    if sigma_n2_hat is None:
+        sigma_n2_hat = estimate_noise_power(Rhat)
+
+    powers = solve_power_ls_nonnegative(
+        Rhat=Rhat,
+        support_deg=support,
+        M=M,
+        sigma_n2_hat=sigma_n2_hat,
+        delta=1e-6,
+    )
+
+    sec_lo, sec_hi = desired_sector
+
+    for _ in range(n_outer):
+        for k in range(len(support)):
+            E = residual_excluding_k(
+                Rhat=Rhat,
+                support_deg=support,
+                powers=powers,
+                sigma_n2_hat=sigma_n2_hat,
+                k=k,
+                M=M,
+            )
+
+            th0 = support[k]
+
+            if k == 0:
+                lo = max(sec_lo, th0 - target_half_width_deg)
+                hi = min(sec_hi, th0 + target_half_width_deg)
+            else:
+                lo = max(-89.0, th0 - interf_half_width_deg)
+                hi = min(89.0, th0 + interf_half_width_deg)
+
+            # 先粗搜
+            th1 = local_peak_search(E, th0, M, lo, hi, step_deg=coarse_step_deg)
+
+            # 再牛顿细修
+            th2 = newton_refine_single_angle(th1, E, M, lo, hi, n_steps=newton_steps)
+
+            # 简单约束：最小角间隔
+            ok = True
+            for j in range(len(support)):
+                if j != k and abs(th2 - support[j]) < min_sep_deg:
+                    ok = False
+                    break
+            if ok:
+                # 干扰不要进目标扇区
+                if not (k >= 1 and sec_lo <= th2 <= sec_hi):
+                    support[k] = th2
+
+        # 每轮只做一次 NNLS
+        powers = solve_power_ls_nonnegative(
+            Rhat=Rhat,
+            support_deg=support,
+            M=M,
+            sigma_n2_hat=sigma_n2_hat,
+            delta=1e-6,
+        )
+
+    return support, powers, sigma_n2_hat
+LINEWIDTH_MAIN = 2.8
+LINEWIDTH_REF = 2.1
+MARKERSIZE = 6.5
+GRID_ALPHA = 0.16
+
+LINEWIDTH_MAIN = 2.9
+LINEWIDTH_REF  = 2.2
+MARKERSIZE     = 6.2
+GRID_ALPHA     = 0.15
+
+COLORS = {
+    "optimal": "#000000",  # 纯黑 - Optimal MVDR（最重要参考）
+    "qh": "#0072B2",  # 鲜艳蓝色 - MP-INCM（的主方法，最突出）
+    "capon": "#E69F00",  # 明亮橙色
+    "meps": "#009E73",  # 森林绿
+    "urglq": "#D55E00",  # 醒目橙红
+    "pglq": "#CC79A7",  # 紫色
+    "sparse": "#8C564B",  # 亮黄色（在深色背景也很突出）
+
+    # 参考线颜色（保持清晰但不抢镜）
+    "true": "#222222",  # 深灰 - True SOI
+    "presumed": "#56B4E9",  # 天蓝 - Presumed SOI
+    "est": "#7C3AED",  # MP 估计角度（保留原紫色）
+    "sector": "#E9D8A6",  # 浅米色扇区背景
+}
+
+METHOD_STYLES = {
+    "Optimal MVDR": dict(color=COLORS["optimal"], ls="-", marker=None,      lw=3.0),
+
+    "MP-INCM":      dict(color=COLORS["qh"],     ls="-", marker="o",       lw=2.9, markersize=7.5),
+    "Capon-INCM":   dict(color=COLORS["capon"],  ls="-", marker="^",       lw=2.4, markersize=7.0),
+    "MEPS-INCM":    dict(color=COLORS["meps"],   ls="-", marker="s",       lw=2.4, markersize=7.0),
+    "URGLQ-INCM":   dict(color=COLORS["urglq"],  ls="-", marker="P",       lw=2.3, markersize=7.5),
+    "PGLQ-INCM":    dict(color=COLORS["pglq"],   ls="-", marker="D",       lw=2.3, markersize=7.0),
+    "Sparse-INCM":  dict(color=COLORS["sparse"], ls="-", marker="v",       lw=2.3, markersize=7.5),
+}
+
+LEGEND_KW = dict(
+    frameon=True,
+    facecolor="white",
+    edgecolor="black",
+    framealpha=1.0,
+    fancybox=False,
+    borderpad=0.28,
+    labelspacing=0.35,
+    handlelength=2.2,
+    handletextpad=0.5,
+)
+
+def add_box_legend(ax, **kwargs):
+    leg = ax.legend(**{**LEGEND_KW, **kwargs})
+    leg.get_frame().set_linewidth(0.8)
+    return leg
+
+ANNO_BBOX = dict(
+    boxstyle="round,pad=0.25",
+    facecolor="white",
+    edgecolor="black",
+    linewidth=1.0,
+    alpha=0.98,
+)
+
+def add_black_edge_legend(ax, **kwargs):
+    leg = ax.legend(**{**LEGEND_KW, **kwargs})
+    leg.get_frame().set_linewidth(1.0)
+    return leg
+
+def plot_method_curve(ax, x, y, name, use_markers=True, label=None):
+    st = METHOD_STYLES[name]
+    marker = st["marker"] if use_markers else None
+    ax.plot(
+        x, y,
+        color=st["color"],
+        linestyle=st["ls"],
+        linewidth=st["lw"],
+        marker=marker,
+        markersize=MARKERSIZE if marker is not None else 0,
+        markerfacecolor="white" if marker is not None else None,
+        markeredgecolor=st["color"] if marker is not None else None,
+        markeredgewidth=1.0 if marker is not None else 0.0,
+        label=name if label is None else label
+    )
+# ============================================================
+# Figure saving
+# ============================================================
+OUTPUT_DIR = "figures_modern_style_look_auto_new"
+
+def ensure_output_dir():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def save_current_figure(filename_stem):
+    ensure_output_dir()
+    png_path = os.path.join(OUTPUT_DIR, f"{filename_stem}.png")
+    pdf_path = os.path.join(OUTPUT_DIR, f"{filename_stem}.pdf")
+    plt.savefig(png_path, bbox_inches="tight", facecolor="white")
+    plt.savefig(pdf_path, bbox_inches="tight", facecolor="white")
+
+
+# ============================================================
+# Basic utilities
+# ============================================================
+def steering_vector(theta_deg, M, d_over_lambda=0.5):
+    theta_rad = np.deg2rad(theta_deg)
+    m = np.arange(M)
+    phase = -1j * 2.0 * np.pi * d_over_lambda * np.sin(theta_rad) * m
+    return np.exp(phase).reshape(-1, 1)
+
+
+def normalize_vec(a):
+    nrm = np.linalg.norm(a)
+    if nrm < 1e-12:
+        return a
+    return a / nrm
+
+
+def sample_covariance(X):
+    return X @ X.conj().T / X.shape[1]
+
+
+def toeplitz_rectify(R):
+    M = R.shape[0]
+    Rt = np.zeros_like(R, dtype=complex)
+    for k in range(-(M - 1), M):
+        diag_mean = np.mean(np.diagonal(R, offset=k))
+        idx = np.arange(M - abs(k))
+        if k >= 0:
+            Rt[idx, idx + k] = diag_mean
+        else:
+            Rt[idx - k, idx] = diag_mean
+    Rt = 0.5 * (Rt + Rt.conj().T)
+    return Rt
+
+
+def mvdr_weight(Ri, a):
+    M = Ri.shape[0]
+    Ri = 0.5 * (Ri + Ri.conj().T)
+    delta = 1e-6 * np.trace(Ri).real / M
+    Ri = Ri + delta * np.eye(M)
+
+    x = np.linalg.solve(Ri, a)
+    denom = (a.conj().T @ x).item()
+    if np.abs(denom) < 1e-12:
+        denom = 1e-12
+    return x / denom
+
+
+def output_sinr_db(w, a_s, Ri_true, sigma_s2):
+    num = sigma_s2 * np.abs((w.conj().T @ a_s).item()) ** 2
+    den = np.real((w.conj().T @ Ri_true @ w).item())
+    val = max(num / max(den, 1e-12), 1e-12)
+    return 10.0 * np.log10(val)
+
+
+def fro_rel_err(A, B):
+    return np.linalg.norm(A - B, "fro") / max(np.linalg.norm(B, "fro"), 1e-12)
+
+
+def beampattern_db(w, M, grid_deg):
+    P = np.zeros_like(grid_deg, dtype=float)
+    for i, th in enumerate(grid_deg):
+        a = steering_vector(th, M)
+        P[i] = np.abs((w.conj().T @ a).item()) ** 2
+    P = P / max(np.max(P), 1e-12)
+    return 10.0 * np.log10(P + 1e-12)
+
+def steering_vector_gain_phase(theta_deg, M, rng,
+                               d_over_lambda=0.5,
+                               gain_std=0.05,
+                               phase_std=0.025*np.pi):
+    """
+    Gain/phase perturbed actual steering vector.
+    Nominal manifold is still steering_vector(theta_deg, M).
+    """
+    a = steering_vector(theta_deg, M, d_over_lambda=d_over_lambda).reshape(-1)
+
+    gamma = rng.normal(0.0, gain_std, size=M)      # gain perturbation
+    delta = rng.normal(0.0, phase_std, size=M)     # phase perturbation
+
+    g = (1.0 + gamma) * np.exp(1j * delta)
+    a_tilde = g * a
+
+    return a_tilde.reshape(-1, 1)
+
+def steering_vector_coherent_scattering(
+    theta0_deg,
+    M,
+    rng,
+    d_over_lambda=0.5,
+    num_scatterers=4,
+    scatter_half_width_deg=2.0,
+    scatter_amp=0.35,
+    direct_amp=1.0,
+    normalize_norm=True,
+):
+    """
+    Coherent local scattering model:
+    a_eff = direct_amp * a(theta0) + sum_q beta_q * a(theta_q)
+
+    - scatterers are located around theta0
+    - beta_q are fixed complex coefficients within one Monte Carlo run
+    - this is coherent scattering because all paths share the same waveform
+    """
+
+    a_eff = direct_amp * steering_vector(theta0_deg, M, d_over_lambda=d_over_lambda)
+
+    scatter_angles = theta0_deg + rng.uniform(
+        -scatter_half_width_deg,
+        scatter_half_width_deg,
+        size=num_scatterers
+    )
+
+    # fixed complex path coefficients in one run
+    mags = (scatter_amp / np.sqrt(max(num_scatterers, 1))) * (
+        0.8 + 0.4 * rng.random(num_scatterers)
+    )
+    phases = rng.uniform(0.0, 2.0 * np.pi, size=num_scatterers)
+    betas = mags * np.exp(1j * phases)
+
+    for beta, th in zip(betas, scatter_angles):
+        a_eff += beta * steering_vector(th, M, d_over_lambda=d_over_lambda)
+
+    if normalize_norm:
+        a_eff = np.sqrt(M) * a_eff / max(np.linalg.norm(a_eff), 1e-12)
+
+    return a_eff.reshape(-1, 1), scatter_angles, betas
+def steering_vector_random_error(theta_deg, M, rng,
+                                 d_over_lambda=0.5,
+                                 rho_max=np.sqrt(0.3),
+                                 preserve_norm=True):
+    """
+    Actual steering vector with additive random steering-vector error.
+    """
+    a = steering_vector(theta_deg, M, d_over_lambda=d_over_lambda).reshape(-1)
+
+    rho = rng.uniform(0.0, rho_max)
+    phi = rng.uniform(0.0, 2*np.pi, size=M)
+
+    xi = (rho / np.sqrt(M)) * np.exp(1j * phi)
+    a_tilde = a + xi
+
+    if preserve_norm:
+        a_tilde = np.sqrt(M) * a_tilde / max(np.linalg.norm(a_tilde), 1e-12)
+
+    return a_tilde.reshape(-1, 1)
+# ============================================================
+# Simulation model
+# ============================================================
+def generate_snapshots(
+    M=20,
+    K=50,
+    theta_s_bar=5.0,
+    theta_i_bar=(-30.0, 25.0),
+    look_err_deg=3.0,
+    snr_db=20.0,
+    inr_db=25.0,
+    sigma_n2=1.0,
+    seed=0,
+
+    # mismatch control
+    mismatch_type="look",              # "look", "gain_phase", "random_sv", "coherent_scattering"
+    apply_mismatch_to_interferers=True,
+
+    # gain/phase perturbation parameters
+    gain_std=0.05,
+    phase_std=0.025 * np.pi,
+
+    # random steering-vector error parameter
+    rho_max=np.sqrt(0.3),
+
+    # coherent local scattering parameters
+    num_scatterers=4,
+    scatter_half_width_deg=2.0,
+    scatter_amp=0.35,
+    direct_amp=1.0,
+):
+    rng = np.random.default_rng(seed)
+
+    theta_s_true = theta_s_bar + rng.uniform(-look_err_deg, look_err_deg)
+    theta_i_true = np.array(theta_i_bar) + rng.uniform(-look_err_deg, look_err_deg, size=2)
+
+    sigma_s2 = 10 ** (snr_db / 10.0) * sigma_n2
+    sigma_i2 = np.ones(2) * (10 ** (inr_db / 10.0) * sigma_n2)
+
+    a_s_bar = steering_vector(theta_s_bar, M)
+
+    if mismatch_type == "look":
+        a_s_true = steering_vector(theta_s_true, M)
+
+        if apply_mismatch_to_interferers:
+            A_i_true = [steering_vector(th, M) for th in theta_i_true]
+        else:
+            A_i_true = [steering_vector(th0, M) for th0 in theta_i_bar]
+
+    elif mismatch_type == "gain_phase":
+        a_s_true = steering_vector_gain_phase(
+            theta_s_true, M, rng,
+            gain_std=gain_std,
+            phase_std=phase_std
+        )
+
+        if apply_mismatch_to_interferers:
+            A_i_true = [
+                steering_vector_gain_phase(
+                    th, M, rng,
+                    gain_std=gain_std,
+                    phase_std=phase_std
+                )
+                for th in theta_i_true
+            ]
+        else:
+            A_i_true = [steering_vector(th, M) for th in theta_i_true]
+
+    elif mismatch_type == "random_sv":
+        a_s_true = steering_vector_random_error(
+            theta_s_true, M, rng,
+            rho_max=rho_max
+        )
+
+        if apply_mismatch_to_interferers:
+            A_i_true = [
+                steering_vector_random_error(
+                    th, M, rng,
+                    rho_max=rho_max
+                )
+                for th in theta_i_true
+            ]
+        else:
+            A_i_true = [steering_vector(th, M) for th in theta_i_true]
+
+    elif mismatch_type == "coherent_scattering":
+        a_s_true, theta_s_scat, beta_s = steering_vector_coherent_scattering(
+            theta_s_true,
+            M,
+            rng,
+            num_scatterers=num_scatterers,
+            scatter_half_width_deg=scatter_half_width_deg,
+            scatter_amp=scatter_amp,
+            direct_amp=direct_amp,
+            normalize_norm=True,
+        )
+
+        # for a clean limitation analysis, keep interferers unchanged first
+        A_i_true = [steering_vector(th, M) for th in theta_i_true]
+
+    else:
+        raise ValueError(f"Unknown mismatch_type: {mismatch_type}")
+
+    s = np.sqrt(sigma_s2) * (
+        rng.standard_normal(K) + 1j * rng.standard_normal(K)
+    ) / np.sqrt(2)
+
+    interferences = [
+        np.sqrt(pw) * (rng.standard_normal(K) + 1j * rng.standard_normal(K)) / np.sqrt(2)
+        for pw in sigma_i2
+    ]
+
+    noise = np.sqrt(sigma_n2) * (
+        rng.standard_normal((M, K)) + 1j * rng.standard_normal((M, K))
+    ) / np.sqrt(2)
+
+    X = a_s_true @ s.reshape(1, -1)
+    for a_i, i_sig in zip(A_i_true, interferences):
+        X += a_i @ i_sig.reshape(1, -1)
+    X += noise
+
+    Rhat = sample_covariance(X)
+
+    Rs_true = sigma_s2 * (a_s_true @ a_s_true.conj().T)
+
+    Ri_true = sigma_n2 * np.eye(M, dtype=complex)
+    for a_i, pw in zip(A_i_true, sigma_i2):
+        Ri_true += pw * (a_i @ a_i.conj().T)
+
+    meta = {
+        "theta_s_true": theta_s_true,
+        "theta_i_true": theta_i_true,
+        "theta_s_bar": theta_s_bar,
+        "sigma_s2": sigma_s2,
+        "sigma_i2": sigma_i2,
+        "sigma_n2": sigma_n2,
+        "mismatch_type": mismatch_type,
+        "apply_mismatch_to_interferers": apply_mismatch_to_interferers,
+        "gain_std": gain_std,
+        "phase_std": phase_std,
+        "rho_max": rho_max,
+        "num_scatterers": num_scatterers,
+        "scatter_half_width_deg": scatter_half_width_deg,
+        "scatter_amp": scatter_amp,
+        "direct_amp": direct_amp,
+    }
+
+    if mismatch_type == "coherent_scattering":
+        meta["theta_s_scat"] = theta_s_scat
+        meta["beta_s"] = beta_s
+
+    return X, Rhat, a_s_true, a_s_bar, Ri_true, Rs_true, meta
+    # ------------------------------------------------------------
+    # 3) snapshot generation
+    # ------------------------------------------------------------
+    s = np.sqrt(sigma_s2) * (
+        rng.standard_normal(K) + 1j * rng.standard_normal(K)
+    ) / np.sqrt(2)
+
+    interferences = [
+        np.sqrt(pw) * (rng.standard_normal(K) + 1j * rng.standard_normal(K)) / np.sqrt(2)
+        for pw in sigma_i2
+    ]
+
+    noise = np.sqrt(sigma_n2) * (
+        rng.standard_normal((M, K)) + 1j * rng.standard_normal((M, K))
+    ) / np.sqrt(2)
+
+    X = a_s_true @ s.reshape(1, -1)
+    for a_i, i_sig in zip(A_i_true, interferences):
+        X += a_i @ i_sig.reshape(1, -1)
+    X += noise
+
+    Rhat = sample_covariance(X)
+
+    # true desired covariance
+    Rs_true = sigma_s2 * (a_s_true @ a_s_true.conj().T)
+
+    # true interference-plus-noise covariance
+    Ri_true = sigma_n2 * np.eye(M, dtype=complex)
+    for a_i, pw in zip(A_i_true, sigma_i2):
+        Ri_true += pw * (a_i @ a_i.conj().T)
+
+    meta = {
+        "theta_s_true": theta_s_true,
+        "theta_i_true": theta_i_true,
+        "theta_s_bar": theta_s_bar,
+        "sigma_s2": sigma_s2,
+        "sigma_i2": sigma_i2,
+        "sigma_n2": sigma_n2,
+        "mismatch_type": mismatch_type,
+        "apply_mismatch_to_interferers": apply_mismatch_to_interferers,
+        "gain_std": gain_std,
+        "phase_std": phase_std,
+        "rho_max": rho_max,
+    }
+
+    return X, Rhat, a_s_true, a_s_bar, Ri_true, Rs_true, meta
+
+# ============================================================
+# Common grid reconstruction
+# ============================================================
+def reconstruct_from_grid_spectrum(grid_deg, P, M, desired_sector, noise_floor=1e-8):
+    theta1, theta2 = desired_sector
+    dth = np.deg2rad(grid_deg[1] - grid_deg[0])
+
+    Rs = np.zeros((M, M), dtype=complex)
+    Ri = np.zeros((M, M), dtype=complex)
+
+    for th, pw in zip(grid_deg, P):
+        a = steering_vector(th, M)
+        if theta1 <= th <= theta2:
+            Rs += pw * (a @ a.conj().T) * dth
+        else:
+            Ri += pw * (a @ a.conj().T) * dth
+
+    Ri += noise_floor * np.eye(M)
+    Rs = 0.5 * (Rs + Rs.conj().T)
+    Ri = 0.5 * (Ri + Ri.conj().T)
+    return Rs, Ri
+
+# ============================================================
+# Common grid reconstruction
+# ============================================================
+def reconstruct_from_grid_spectrum(grid_deg, P, M, desired_sector, noise_floor=1e-8):
+    theta1, theta2 = desired_sector
+    dth = np.deg2rad(grid_deg[1] - grid_deg[0])
+
+    Rs = np.zeros((M, M), dtype=complex)
+    Ri = np.zeros((M, M), dtype=complex)
+
+    for th, pw in zip(grid_deg, P):
+        a = steering_vector(th, M)
+        if theta1 <= th <= theta2:
+            Rs += pw * (a @ a.conj().T) * dth
+        else:
+            Ri += pw * (a @ a.conj().T) * dth
+
+    Ri += noise_floor * np.eye(M)
+    Rs = 0.5 * (Rs + Rs.conj().T)
+    Ri = 0.5 * (Ri + Ri.conj().T)
+    return Rs, Ri
+
+
+def capon_spectrum_from_inverse(Rinv, grid_deg, M):
+    P = np.zeros_like(grid_deg, dtype=float)
+    for i, th in enumerate(grid_deg):
+        a = steering_vector(th, M)
+        den = np.real((a.conj().T @ Rinv @ a).item())
+        P[i] = 1.0 / max(den, 1e-12)
+    return P
+
+
+def safe_inverse(R, loading_scale=1e-6):
+    M = R.shape[0]
+    R = 0.5 * (R + R.conj().T)
+    delta = loading_scale * max(np.trace(R).real / M, 1e-12)
+    return np.linalg.inv(R + delta * np.eye(M))
+
+
+def estimate_noise_power(R):
+    evals = np.linalg.eigvalsh(0.5 * (R + R.conj().T))
+    return max(float(np.min(np.real(evals))), 1e-8)
+
+
+def find_top_spectrum_peaks(grid_deg, P, exclude_sector=None, num_peaks=2, min_sep_deg=6.0):
+    mask = np.ones_like(grid_deg, dtype=bool)
+    if exclude_sector is not None:
+        mask &= (grid_deg < exclude_sector[0]) | (grid_deg > exclude_sector[1])
+
+    cand = []
+    for i in range(1, len(grid_deg) - 1):
+        if not mask[i]:
+            continue
+        if P[i] >= P[i - 1] and P[i] >= P[i + 1]:
+            cand.append(i)
+
+    if not cand:
+        cand = list(np.where(mask)[0])
+
+    cand = sorted(cand, key=lambda i: P[i], reverse=True)
+    chosen = []
+    for idx in cand:
+        th = grid_deg[idx]
+        if all(abs(th - c) >= min_sep_deg for c in chosen):
+            chosen.append(float(th))
+        if len(chosen) >= num_peaks:
+            break
+
+    return chosen
+
+
+def merge_intervals(intervals):
+    intervals = [(float(a), float(b)) for a, b in intervals if b > a]
+    if not intervals:
+        return []
+    intervals.sort()
+    merged = [list(intervals[0])]
+    for a, b in intervals[1:]:
+        if a <= merged[-1][1] + 1e-9:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [tuple(x) for x in merged]
+
+
+def clip_interval_against_sector(a_deg, b_deg, desired_sector):
+    t1, t2 = desired_sector
+    out = []
+    a_deg, b_deg = float(a_deg), float(b_deg)
+    if b_deg <= a_deg:
+        return out
+    if b_deg <= t1 or a_deg >= t2:
+        return [(a_deg, b_deg)]
+    if a_deg < t1:
+        out.append((a_deg, min(b_deg, t1)))
+    if b_deg > t2:
+        out.append((max(a_deg, t2), b_deg))
+    return out
+
+
+def intervals_from_peak_windows(peak_angles, half_width_deg, desired_sector, angle_limits=(-90.0, 90.0)):
+    intervals = []
+    lo, hi = angle_limits
+    for pk in peak_angles:
+        a = max(lo, pk - half_width_deg)
+        b = min(hi, pk + half_width_deg)
+        intervals.extend(clip_interval_against_sector(a, b, desired_sector))
+    return merge_intervals(intervals)
+
+
+def gauss_legendre_matrix_integral(Rinv, M, intervals_deg, Q=3):
+    z, w = np.polynomial.legendre.leggauss(Q)
+    R = np.zeros((M, M), dtype=complex)
+    for a_deg, b_deg in intervals_deg:
+        a_rad = np.deg2rad(a_deg)
+        b_rad = np.deg2rad(b_deg)
+        mid = 0.5 * (a_rad + b_rad)
+        half = 0.5 * (b_rad - a_rad)
+        for zi, wi in zip(z, w):
+            th_deg = np.rad2deg(mid + half * zi)
+            a = steering_vector(th_deg, M)
+            den = np.real((a.conj().T @ Rinv @ a).item())
+            pw = 1.0 / max(den, 1e-12)
+            R += wi * pw * (a @ a.conj().T) * half
+    return 0.5 * (R + R.conj().T)
+
+
+def estimate_steering_by_sector_scan(Ri, desired_sector, M, n_grid=181):
+    grid = np.linspace(desired_sector[0], desired_sector[1], n_grid)
+    Rinv = safe_inverse(Ri, loading_scale=1e-6)
+    P = capon_spectrum_from_inverse(Rinv, grid, M)
+    th = float(grid[np.argmax(P)])
+    return normalize_vec(steering_vector(th, M)), th, P
+
+def project_to_hpd(R, floor_ratio=1e-6):
+    R = 0.5 * (R + R.conj().T)
+    evals, evecs = np.linalg.eigh(R)
+    floor = floor_ratio * max(np.max(np.real(evals)), 1.0)
+    evals = np.maximum(np.real(evals), floor)
+    return evecs @ np.diag(evals) @ evecs.conj().T
+
+
+def estimate_steering_qcqp(Ri, a_bar, eps=1e-6, relax=1e-6):
+    M = Ri.shape[0]
+    a0 = a_bar.flatten().astype(complex)
+
+    # 1) 先把 Ri 投影到 Hermitian PSD，避免数值假不可行
+    Ri_psd = project_to_hpd(Ri, floor_ratio=1e-6)
+
+    # 2) 更稳的逆矩阵
+    Ri_inv = np.linalg.inv(Ri_psd + eps * np.eye(M, dtype=complex))
+
+    # 3) 变量
+    er = cp.Variable(M)
+    ei = cp.Variable(M)
+    e = er + 1j * ei
+    a_new = a0 + e
+
+    # 4) 目标
+    objective = cp.real(cp.quad_form(a_new, Ri_inv))
+
+    # 5) 约束：给一点松弛量，别卡在边界上
+    rhs = float(np.real(a0.conj().T @ Ri_psd @ a0))
+    constraints = [
+        cp.real(a0.conj().T @ e) == 0,
+        cp.imag(a0.conj().T @ e) == 0,
+        cp.real(cp.quad_form(a_new, Ri_psd)) <= rhs + relax * max(abs(rhs), 1.0)
+    ]
+
+    prob = cp.Problem(cp.Minimize(objective), constraints)
+
+    try:
+        if "SCS" in cp.installed_solvers():
+            prob.solve(solver=cp.SCS, verbose=False, max_iters=8000, eps=1e-5)
+        elif "ECOS" in cp.installed_solvers():
+            prob.solve(solver=cp.ECOS, verbose=False, max_iters=1000)
+        else:
+            print(f"[QCQP] No suitable solver found: {cp.installed_solvers()}")
+            return normalize_vec(a0).reshape(-1, 1)
+
+        if prob.status in ["optimal", "optimal_inaccurate"] and er.value is not None and ei.value is not None:
+            e_opt = er.value + 1j * ei.value
+            a_hat = a0 + e_opt
+            return normalize_vec(a_hat).reshape(-1, 1)
+
+        print(f"[QCQP] status = {prob.status}, fallback to presumed vector")
+
+    except Exception as ex:
+        print(f"[QCQP] Solve failed: {ex}, fallback to presumed vector")
+
+    return normalize_vec(a0).reshape(-1, 1)
+def build_pglq_theta_intervals(desired_sector, delta_interval_u):
+    t1, t2 = desired_sector
+    u_segments = [(-1.0, np.sin(np.deg2rad(t1))), (np.sin(np.deg2rad(t2)), 1.0)]
+    intervals = []
+    for ua, ub in u_segments:
+        if ub <= ua:
+            continue
+        n_parts = max(1, int(np.ceil((ub - ua) / max(delta_interval_u, 1e-6))))
+        edges_u = np.linspace(ua, ub, n_parts + 1)
+        edges_th = np.rad2deg(np.arcsin(np.clip(edges_u, -1.0, 1.0)))
+        intervals.extend((edges_th[i], edges_th[i + 1]) for i in range(n_parts))
+    return intervals
+
+
+def build_taper_matrix(M, delta_zk_u):
+    idx = np.arange(M)
+    diff = idx[:, None] - idx[None, :]
+    T = np.ones((M, M), dtype=float)
+    mask = diff != 0
+    x = diff.astype(float) * float(delta_zk_u)
+    T[mask] = np.sin(x[mask]) / x[mask]
+    return T
+
+
+def auxiliary_desired_covariance(Rinv, M, desired_sector, Q=5):
+    return gauss_legendre_matrix_integral(Rinv, M, [desired_sector], Q=Q)
+# ============================================================
+# Capon-IPNC
+# ============================================================
+def capon_spectrum(Rhat, grid_deg, loading=1e-3):
+    M = Rhat.shape[0]
+    delta = loading * np.trace(Rhat).real / M
+    Rdl = Rhat + delta * np.eye(M)
+    Rinv = np.linalg.inv(Rdl)
+    return capon_spectrum_from_inverse(Rinv, grid_deg, M)
+
+# ============================================================
+# URGLQ-IPNC
+# ============================================================
+def urglq_ipnc_beamformer(
+    Rhat,
+    theta_s_bar,
+    desired_sector,
+    interference_intervals=None,
+    grid_deg=None,
+    glq_order=3,
+    num_interferers=2,
+    interference_half_width_deg=8.0,
+):
+    if grid_deg is None:
+        grid_deg = np.linspace(-90.0, 90.0, 721)
+
+    M = Rhat.shape[0]
+    a_bar = steering_vector(theta_s_bar, M)
+    I = np.eye(M, dtype=complex)
+
+    alpha = 100.0 * np.trace(Rhat).real
+    C = alpha * (a_bar @ a_bar.conj().T) + I
+    evals_c, evecs_c = np.linalg.eigh(0.5 * (C + C.conj().T))
+    p1 = evecs_c[:, np.argmax(evals_c)].reshape(-1, 1)
+    B = I - p1 @ p1.conj().T
+
+    sigma_n2_est = estimate_noise_power(Rhat)
+    R_tilde = B.conj().T @ Rhat @ B + sigma_n2_est * I
+    Rinv_tilde = safe_inverse(R_tilde, loading_scale=1e-6)
+
+    P_tilde = capon_spectrum_from_inverse(Rinv_tilde, grid_deg, M)
+
+    if interference_intervals is None:
+        peak_angles = find_top_spectrum_peaks(
+            grid_deg,
+            P_tilde,
+            exclude_sector=desired_sector,
+            num_peaks=num_interferers,
+            min_sep_deg=interference_half_width_deg / 1.5,
+        )
+        intervals = intervals_from_peak_windows(
+            peak_angles,
+            half_width_deg=interference_half_width_deg,
+            desired_sector=desired_sector,
+        )
+        if not intervals:
+            intervals = [(-90.0, desired_sector[0]), (desired_sector[1], 90.0)]
+    else:
+        peak_angles = None
+        intervals = interference_intervals
+
+    Ri = gauss_legendre_matrix_integral(Rinv_tilde, M, intervals, Q=glq_order)
+    Ri += sigma_n2_est * I
+    Ri = 0.5 * (Ri + Ri.conj().T)
+
+    Rinv_full = safe_inverse(Rhat, loading_scale=1e-3)
+    Rs = auxiliary_desired_covariance(Rinv_full, M, desired_sector, Q=5)
+
+    a_hat = estimate_steering_qcqp(Ri, a_bar)
+    theta_hat = None
+    P_sig = None
+    w = mvdr_weight(Ri, a_hat)
+
+    info = {
+        "alpha": alpha,
+        "sigma_n2_est": sigma_n2_est,
+        "peak_angles": peak_angles,
+        "intervals": intervals,
+        "theta_hat": theta_hat,
+        "P_tilde": P_tilde,
+        "P_sig_scan": P_sig,
+    }
+    return w, info, Rs, Ri, a_hat
+
+
+# ============================================================
+# PGLQ-IPNC
+# ============================================================
+def pglq_ipnc_beamformer(
+    Rhat,
+    theta_s_bar,
+    desired_sector,
+    grid_deg=None,
+    Q=3,
+    eig_energy_ratio=0.9,
+    delta_zk_u=0.03,
+    g_candidates=None,
+):
+    if grid_deg is None:
+        grid_deg = np.linspace(-90.0, 90.0, 721)
+    if g_candidates is None:
+        g_candidates = np.linspace(0.0, 1.6, 33)
+
+    M = Rhat.shape[0]
+    a_bar = steering_vector(theta_s_bar, M)
+    I = np.eye(M, dtype=complex)
+
+    Rh = 0.5 * (Rhat + Rhat.conj().T)
+    evals, evecs = np.linalg.eigh(Rh)
+    order = np.argsort(evals)[::-1]
+    evals = np.real(evals[order])
+    evecs = evecs[:, order]
+    cum_ratio = np.cumsum(np.maximum(evals, 0.0)) / max(np.sum(np.maximum(evals, 0.0)), 1e-12)
+    L = int(np.searchsorted(cum_ratio, eig_energy_ratio) + 1)
+    L = max(1, min(L, M))
+    Us = evecs[:, :L]
+    Ps = Us @ Us.conj().T
+
+    P_capon = capon_spectrum(Rhat, grid_deg, loading=1e-3)
+    peak_angles = find_top_spectrum_peaks(
+        grid_deg, P_capon, exclude_sector=desired_sector, num_peaks=2, min_sep_deg=6.0
+    )
+    T = build_taper_matrix(M, delta_zk_u)
+
+    target_vals = []
+    Rinv_base = safe_inverse(Rhat, loading_scale=1e-3)
+    for th in peak_angles:
+        a = steering_vector(th, M)
+        target_vals.append(1.0 / max(np.real((a.conj().T @ Rinv_base @ a).item()), 1e-12))
+    target_log = np.mean(np.log(np.maximum(target_vals, 1e-12))) if target_vals else 0.0
+
+    best = None
+    for g in g_candidates:
+        A = I + g * Ps
+        R_d = A @ Rhat @ A.conj().T
+        R_t = 0.5 * ((R_d * T) + (R_d * T).conj().T)
+        Rinv_t = safe_inverse(R_t, loading_scale=1e-6)
+        vals = []
+        for th in peak_angles:
+            a = steering_vector(th, M)
+            vals.append(1.0 / max(np.real((a.conj().T @ Rinv_t @ a).item()), 1e-12))
+        cur_log = np.mean(np.log(np.maximum(vals, 1e-12))) if vals else 0.0
+        err = abs(cur_log - target_log)
+        if best is None or err < best[0]:
+            best = (err, float(g), R_t, Rinv_t)
+
+    _, g_opt, R_t, Rinv_t = best
+
+    z, _ = np.polynomial.legendre.leggauss(Q)
+    delta_z = np.max(np.diff(z)) if len(z) > 1 else 2.0
+    delta_interval_u = 2.0 * delta_zk_u / max(delta_z, 1e-6)
+    theta_intervals = build_pglq_theta_intervals(desired_sector, delta_interval_u)
+
+    Ri = gauss_legendre_matrix_integral(Rinv_t, M, theta_intervals, Q=Q)
+    Ri += estimate_noise_power(R_t) * I
+    Ri = 0.5 * (Ri + Ri.conj().T)
+
+    Rs = auxiliary_desired_covariance(Rinv_t, M, desired_sector, Q=max(Q, 5))
+    a_hat = Rs @ a_bar
+    if np.linalg.norm(a_hat) < 1e-12:
+        a_hat = a_bar.copy()
+    a_hat = normalize_vec(a_hat)
+
+    w = mvdr_weight(Ri, a_hat)
+    P_broad = capon_spectrum_from_inverse(Rinv_t, grid_deg, M)
+
+    info = {
+        "L": L,
+        "g": g_opt,
+        "delta_zk_u": delta_zk_u,
+        "delta_interval_u": delta_interval_u,
+        "num_intervals": len(theta_intervals),
+        "peak_angles": peak_angles,
+        "P_broad": P_broad,
+    }
+    return w, info, Rs, Ri, a_hat
+# ============================================================
+# Capon-IPNC
+# ============================================================
+def capon_spectrum(Rhat, grid_deg, loading=1e-3):
+    M = Rhat.shape[0]
+    delta = loading * np.trace(Rhat).real / M
+    Rdl = Rhat + delta * np.eye(M)
+    Rinv = np.linalg.inv(Rdl)
+
+    P = np.zeros_like(grid_deg, dtype=float)
+    for i, th in enumerate(grid_deg):
+        a = steering_vector(th, M)
+        den = np.real((a.conj().T @ Rinv @ a).item())
+        P[i] = 1.0 / max(den, 1e-12)
+    return P
+
+
+def capon_ipnc_beamformer(Rhat, theta_s_bar, desired_sector, grid_deg, loading=1e-3):
+    M = Rhat.shape[0]
+    a_bar = steering_vector(theta_s_bar, M)
+
+    P_capon = capon_spectrum(Rhat, grid_deg, loading=loading)
+    Rs, Ri = reconstruct_from_grid_spectrum(grid_deg, P_capon, M, desired_sector)
+
+    a_hat = Rs @ a_bar
+    if np.linalg.norm(a_hat) < 1e-12:
+        a_hat = a_bar.copy()
+    a_hat = normalize_vec(a_hat)
+
+    w = mvdr_weight(Ri, a_hat)
+    return w, P_capon, Rs, Ri, a_hat
+
+
+# ============================================================
+# MEPS-IPNC
+# ============================================================
+def meps_spectrum_from_inverse(Rinv, grid_deg, M):
+    u1 = np.zeros((M, 1), dtype=complex)
+    u1[0, 0] = 1.0
+
+    gamma_p = 1.0 / np.real((u1.T @ Rinv @ u1).item())
+    gamma_p = max(gamma_p, 1e-12)
+
+    v = Rinv @ u1
+
+    P = np.zeros_like(grid_deg, dtype=float)
+    for i, th in enumerate(grid_deg):
+        a = steering_vector(th, M)
+        z = (a.conj().T @ v).item()
+        den = gamma_p * (np.abs(z) ** 2)
+        P[i] = 1.0 / max(den, 1e-12)
+
+    return P, gamma_p, v
+
+
+def meps_ipnc_beamformer(
+    Rhat,
+    theta_s_bar,
+    desired_sector,
+    alpha=5,
+    S=20,
+    loading=1e-3,
+):
+    M = Rhat.shape[0]
+    a_bar = steering_vector(theta_s_bar, M)
+
+    L = int(alpha * M)
+    delta = loading * np.trace(Rhat).real / M
+    Rdl = Rhat + delta * np.eye(M)
+    Rinv = np.linalg.inv(Rdl)
+
+    grid_all = np.linspace(-90.0, 90.0, L)
+    mask_ipn = (grid_all < desired_sector[0]) | (grid_all > desired_sector[1])
+    grid_ipn = grid_all[mask_ipn]
+
+    P_ipn, gamma_p, v = meps_spectrum_from_inverse(Rinv, grid_ipn, M)
+    dth_ipn = np.deg2rad(grid_ipn[1] - grid_ipn[0])
+
+    Ri = np.zeros((M, M), dtype=complex)
+    for th, pw in zip(grid_ipn, P_ipn):
+        a = steering_vector(th, M)
+        Ri += pw * (a @ a.conj().T) * dth_ipn
+    Ri = 0.5 * (Ri + Ri.conj().T)
+    Ri += 1e-8 * np.eye(M)
+
+    grid_sig = np.linspace(desired_sector[0], desired_sector[1], S)
+    P_sig, _, _ = meps_spectrum_from_inverse(Rinv, grid_sig, M)
+    dth_sig = np.deg2rad(grid_sig[1] - grid_sig[0])
+
+    Rs = np.zeros((M, M), dtype=complex)
+    for th, pw in zip(grid_sig, P_sig):
+        a = steering_vector(th, M)
+        Rs += pw * (a @ a.conj().T) * dth_sig
+    Rs = 0.5 * (Rs + Rs.conj().T)
+
+    a_hat = Rs @ a_bar
+    if np.linalg.norm(a_hat) < 1e-12:
+        a_hat = a_bar.copy()
+    a_hat = normalize_vec(a_hat)
+
+    w = mvdr_weight(Ri, a_hat)
+
+    info = {
+        "gamma_p": gamma_p,
+        "Rinv_u1": v,
+        "L": L,
+        "S": S,
+    }
+    return w, info, Rs, Ri, a_hat
+
+
+# ============================================================
+# QH-PSE-IPNC
+# ============================================================
+def build_hankel_pair(seq, L=None):
+    x = np.asarray(seq, dtype=complex).reshape(-1)
+    N = len(x)
+
+    if L is None:
+        L = N // 2
+
+    L = int(max(2, min(L, N - 2)))
+    K = N - L
+
+    Y0 = np.array([x[i:i + K] for i in range(L)], dtype=complex)
+    Y1 = np.array([x[i + 1:i + K + 1] for i in range(L)], dtype=complex)
+    return Y0, Y1, L, K
+
+
+def auto_select_order_from_svals(svals, max_order=8, min_rel_level=1e-3):
+    svals = np.asarray(svals, dtype=float).reshape(-1)
+    if len(svals) < 2:
+        return 1
+
+    max_order = min(max_order, len(svals) - 1)
+    s = svals[:max_order + 1]
+
+    valid = (s[:-1] / max(s[0], 1e-12)) > min_rel_level
+    candidate_idx = np.where(valid)[0]
+    if len(candidate_idx) == 0:
+        return 1
+
+    gaps = s[:-1] / np.maximum(s[1:], 1e-12)
+    best_local = candidate_idx[np.argmax(gaps[candidate_idx])]
+    return int(best_local + 1)
+
+
+def matrix_pencil_poles_from_seq(seq, order, L=None):
+    Y0, Y1, L, K = build_hankel_pair(seq, L=L)
+    U, svals, Vh = np.linalg.svd(Y0, full_matrices=False)
+
+    order = int(max(1, min(order, len(svals), U.shape[1], Vh.shape[0])))
+
+    Ur = U[:, :order]
+    Vr = Vh.conj().T[:, :order]
+    Sr = svals[:order]
+
+    Sinv_sqrt = np.diag(1.0 / np.sqrt(np.maximum(Sr, 1e-12)))
+    Z = Sinv_sqrt @ (Ur.conj().T @ Y1 @ Vr) @ Sinv_sqrt
+
+    poles, _ = np.linalg.eig(Z)
+    poles = poles / np.maximum(np.abs(poles), 1e-12)
+    return poles, svals
+
+
+def qh_pse_spectrum_from_covariance(
+    Rhat,
+    model_order=None,
+    max_order=8,
+    grid_deg=None,
+    kernel_width_deg=1.2,
+):
+    M = Rhat.shape[0]
+    if grid_deg is None:
+        grid_deg = np.linspace(-90, 90, 721)
+
+    delta = 1e-4 * np.trace(Rhat).real / M
+    Rt = toeplitz_rectify(Rhat + delta * np.eye(M))
+
+    r = Rt[:, 0].copy()
+    seq = r[1:]
+
+    Y0, _, L, _ = build_hankel_pair(seq, L=None)
+    _, svals0, _ = np.linalg.svd(Y0, full_matrices=False)
+
+    if model_order is None:
+        order_hat = auto_select_order_from_svals(
+            svals0,
+            max_order=max_order,
+            min_rel_level=1e-3
+        )
+    else:
+        order_hat = int(model_order)
+
+    poles, svals = matrix_pencil_poles_from_seq(seq, order=order_hat, L=L)
+
+    u_est = -np.angle(poles) / np.pi
+    valid = np.abs(u_est) <= 1.0
+    poles = poles[valid]
+    u_est = u_est[valid]
+    theta_est = np.rad2deg(np.arcsin(np.clip(u_est, -1.0, 1.0)))
+
+    lags = np.arange(1, M)
+    if len(poles) > 0:
+        V = poles[None, :] ** lags[:, None]
+        amp_est, *_ = np.linalg.lstsq(V, seq, rcond=None)
+        power_est = np.maximum(np.real(amp_est), 0.0)
+    else:
+        power_est = np.array([])
+
+    if power_est.size > 0 and np.max(power_est) > 0:
+        keep = power_est > 1e-4 * np.max(power_est)
+        theta_est = theta_est[keep]
+        power_est = power_est[keep]
+
+    sigma_n2_est = max(np.real(r[0]) - np.sum(power_est), 1e-8)
+
+    P_grid = np.zeros_like(grid_deg, dtype=float)
+    for th, pw in zip(theta_est, power_est):
+        P_grid += pw * np.exp(-0.5 * ((grid_deg - th) / kernel_width_deg) ** 2)
+    P_grid += sigma_n2_est * 1e-3
+
+    spec = {
+        "theta_est": theta_est,
+        "power_est": power_est,
+        "sigma_n2_est": sigma_n2_est,
+        "singular_values": svals,
+        "model_order": order_hat,
+        "P_grid": P_grid,
+    }
+    return spec
+
+def covariance_reconstruction_cost(Rhat, support_deg, powers, sigma_n2_hat, M):
+    Rm = sigma_n2_hat * np.eye(M, dtype=complex)
+    for th, pw in zip(np.asarray(support_deg).reshape(-1), np.asarray(powers).reshape(-1)):
+        a = steering_vector(th, M)
+        Rm += float(pw) * (a @ a.conj().T)
+    Rm = 0.5 * (Rm + Rm.conj().T)
+    Rh = 0.5 * (Rhat + Rhat.conj().T)
+    return np.linalg.norm(Rh - Rm, "fro")
+
+
+def refine_qh_angles(
+    Rhat,
+    init_support_deg,
+    desired_sector,
+    sigma_n2_hat=None,
+    n_iter=3,
+    search_half_width_deg=2.0,
+    search_step_deg=0.05,
+    min_sep_deg=2.0,
+):
+    M = Rhat.shape[0]
+    support = np.asarray(init_support_deg, dtype=float).copy()
+
+    if sigma_n2_hat is None:
+        sigma_n2_hat = estimate_noise_power(Rhat)
+
+    # 默认第 1 个是目标，其余是干扰
+    for _ in range(n_iter):
+        for k in range(len(support)):
+            cur = support[k]
+
+            if k == 0:
+                lo = max(desired_sector[0], cur - search_half_width_deg)
+                hi = min(desired_sector[1], cur + search_half_width_deg)
+            else:
+                lo = cur - search_half_width_deg
+                hi = cur + search_half_width_deg
+
+            grid = np.arange(lo, hi + 0.5 * search_step_deg, search_step_deg)
+
+            best_th = cur
+            best_cost = np.inf
+
+            for th in grid:
+                cand = support.copy()
+                cand[k] = th
+
+                # 保证干扰不要跑进目标扇区
+                if k >= 1 and (desired_sector[0] <= th <= desired_sector[1]):
+                    continue
+
+                # 最小间隔约束
+                ok = True
+                for j in range(len(cand)):
+                    if j != k and abs(cand[j] - cand[k]) < min_sep_deg:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+
+                p_hat = solve_power_ls_nonnegative(
+                    Rhat=Rhat,
+                    support_deg=cand,
+                    M=M,
+                    sigma_n2_hat=sigma_n2_hat,
+                    delta=1e-6,
+                )
+
+                cost = covariance_reconstruction_cost(
+                    Rhat=Rhat,
+                    support_deg=cand,
+                    powers=p_hat,
+                    sigma_n2_hat=sigma_n2_hat,
+                    M=M,
+                )
+
+                if cost < best_cost:
+                    best_cost = cost
+                    best_th = th
+
+            support[k] = best_th
+
+        search_half_width_deg *= 0.6
+        search_step_deg *= 0.6
+
+    p_hat = solve_power_ls_nonnegative(
+        Rhat=Rhat,
+        support_deg=support,
+        M=M,
+        sigma_n2_hat=sigma_n2_hat,
+        delta=1e-6,
+    )
+
+    return support, p_hat, sigma_n2_hat
+def select_qh_angles(spec_qh, desired_sector, theta_s_bar, num_interf=2):
+    theta_est = np.asarray(spec_qh["theta_est"], dtype=float)
+    power_est = np.asarray(spec_qh["power_est"], dtype=float)
+
+    in_sector = (theta_est >= desired_sector[0]) & (theta_est <= desired_sector[1])
+
+    # 目标：优先选扇区内离 theta_s_bar 最近的
+    theta_sig = theta_est[in_sector]
+    power_sig = power_est[in_sector]
+
+    if theta_sig.size > 0:
+        i_sig = np.argmin(np.abs(theta_sig - theta_s_bar))
+        theta_s = float(theta_sig[i_sig])
+    else:
+        theta_s = float(theta_s_bar)
+
+    # 干扰：扇区外按功率从大到小选 num_interf 个
+    theta_int = theta_est[~in_sector]
+    power_int = power_est[~in_sector]
+
+    if theta_int.size > 0:
+        idx = np.argsort(power_int)[::-1][:num_interf]
+        theta_i = theta_int[idx]
+    else:
+        theta_i = np.array([], dtype=float)
+
+    return theta_s, np.asarray(theta_i, dtype=float)
+# def qh_ipnc_beamformer(
+#     Rhat,
+#     theta_s_bar,
+#     desired_sector,
+#     grid_deg=None,
+#     model_order=None,
+#     max_order=6,
+# ):
+#     if grid_deg is None:
+#         grid_deg = np.linspace(-90, 90, 721)
+#
+#     M = Rhat.shape[0]
+#     a_bar = steering_vector(theta_s_bar, M)
+#
+#     spec = qh_pse_spectrum_from_covariance(
+#         Rhat=Rhat,
+#         model_order=model_order,
+#         max_order=max_order,
+#         grid_deg=grid_deg,
+#         kernel_width_deg=1.2,
+#     )
+#
+#     Rs = np.zeros((M, M), dtype=complex)
+#     Ri = spec["sigma_n2_est"] * np.eye(M, dtype=complex)
+#
+#     for th, pw in zip(spec["theta_est"], spec["power_est"]):
+#         a = steering_vector(th, M)
+#         if desired_sector[0] <= th <= desired_sector[1]:
+#             Rs += pw * (a @ a.conj().T)
+#         else:
+#             Ri += pw * (a @ a.conj().T)
+#
+#     Rs = 0.5 * (Rs + Rs.conj().T)
+#     Ri = 0.5 * (Ri + Ri.conj().T)
+#
+#     a_hat = Rs @ a_bar
+#     if np.linalg.norm(a_hat) < 1e-12:
+#         a_hat = a_bar.copy()
+#     a_hat = normalize_vec(a_hat)
+#
+#     w = mvdr_weight(Ri, a_hat)
+#     return w, spec, Rs, Ri, a_hat
+def theta_to_u(theta_deg):
+    return np.sin(np.deg2rad(theta_deg))
+
+
+def u_to_theta_deg(u):
+    u = np.clip(np.asarray(u, dtype=float), -0.999999, 0.999999)
+    return np.rad2deg(np.arcsin(u))
+
+
+def build_qh_model_from_support(support_deg, powers, sigma_n2_hat, theta_s_bar, M):
+    support_deg = np.asarray(support_deg, dtype=float).reshape(-1)
+    powers = np.asarray(powers, dtype=float).reshape(-1)
+
+    a_bar = steering_vector(theta_s_bar, M)
+
+    Rs = np.zeros((M, M), dtype=complex)
+    Ri = float(sigma_n2_hat) * np.eye(M, dtype=complex)
+
+    for k, (th, pw) in enumerate(zip(support_deg, powers)):
+        a = steering_vector(th, M)
+        pw = max(float(pw), 1e-12)
+
+        if k == 0:
+            Rs += pw * (a @ a.conj().T)
+        else:
+            Ri += pw * (a @ a.conj().T)
+
+    Rs = 0.5 * (Rs + Rs.conj().T)
+    Ri = 0.5 * (Ri + Ri.conj().T)
+
+    a_hat = Rs @ a_bar
+    if np.linalg.norm(a_hat) < 1e-12:
+        a_hat = steering_vector(float(support_deg[0]), M)
+    a_hat = normalize_vec(a_hat)
+
+    return Rs, Ri, a_hat
+
+
+def beamformer_surrogate_score(support_deg, powers, sigma_n2_hat, theta_s_bar, M):
+    Rs, Ri, a_hat = build_qh_model_from_support(
+        support_deg=support_deg,
+        powers=powers,
+        sigma_n2_hat=sigma_n2_hat,
+        theta_s_bar=theta_s_bar,
+        M=M,
+    )
+
+    w = mvdr_weight(Ri, a_hat)
+
+    num = np.real((w.conj().T @ Rs @ w).item())
+    den = np.real((w.conj().T @ Ri @ w).item())
+
+    return num / max(den, 1e-12)
+
+
+def qh_cobyqa_objective(
+    u,
+    Rhat,
+    init_support_deg,
+    desired_sector,
+    theta_s_bar,
+    sigma_n2_hat,
+    min_sep_deg=2.0,
+    lambda_sector=5e2,
+    lambda_sep=5e2,
+    lambda_local=1e-2,
+):
+    M = Rhat.shape[0]
+    theta = u_to_theta_deg(u)
+
+    sec_lo, sec_hi = desired_sector
+    penalty = 0.0
+
+    # 干扰角不能进目标扇区
+    for k in range(1, len(theta)):
+        th = theta[k]
+        if sec_lo <= th <= sec_hi:
+            dist_to_edge = min(th - sec_lo, sec_hi - th)
+            penalty += lambda_sector * (dist_to_edge + 1e-3) ** 2
+
+    # 最小角间隔
+    for i in range(len(theta)):
+        for j in range(i + 1, len(theta)):
+            gap = abs(theta[i] - theta[j])
+            if gap < min_sep_deg:
+                penalty += lambda_sep * (min_sep_deg - gap) ** 2
+
+    # 不要离粗估计太远
+    penalty += lambda_local * np.sum((theta - np.asarray(init_support_deg, dtype=float)) ** 2)
+
+    p_hat = solve_power_ls_nonnegative(
+        Rhat=Rhat,
+        support_deg=theta,
+        M=M,
+        sigma_n2_hat=sigma_n2_hat,
+        delta=1e-6,
+    )
+
+    score = beamformer_surrogate_score(
+        support_deg=theta,
+        powers=p_hat,
+        sigma_n2_hat=sigma_n2_hat,
+        theta_s_bar=theta_s_bar,
+        M=M,
+    )
+
+    return -np.log(max(score, 1e-12)) + penalty
+
+
+def refine_qh_angles_cobyqa(
+    Rhat,
+    init_support_deg,
+    desired_sector,
+    theta_s_bar,
+    sigma_n2_hat=None,
+    min_sep_deg=2.0,
+    target_half_width_deg=3.0,
+    interf_half_width_deg=5.0,
+    maxiter=120,
+):
+    M = Rhat.shape[0]
+    init_support_deg = np.asarray(init_support_deg, dtype=float).copy()
+
+    if sigma_n2_hat is None:
+        sigma_n2_hat = estimate_noise_power(Rhat)
+
+    sec_lo, sec_hi = desired_sector
+    x0 = theta_to_u(init_support_deg)
+
+    lb = np.zeros_like(x0, dtype=float)
+    ub = np.zeros_like(x0, dtype=float)
+
+    # 目标角：限制在目标扇区内，并在粗估计附近局部优化
+    t0 = init_support_deg[0]
+    lo_th = max(sec_lo, t0 - target_half_width_deg)
+    hi_th = min(sec_hi, t0 + target_half_width_deg)
+    lb[0] = theta_to_u(lo_th)
+    ub[0] = theta_to_u(hi_th)
+
+    # 干扰角：围绕粗估计做局部优化
+    for k in range(1, len(x0)):
+        tk = init_support_deg[k]
+        lo_th = max(-89.0, tk - interf_half_width_deg)
+        hi_th = min(89.0, tk + interf_half_width_deg)
+        lb[k] = theta_to_u(lo_th)
+        ub[k] = theta_to_u(hi_th)
+
+    bounds = Bounds(lb, ub)
+
+    res = minimize(
+        fun=qh_cobyqa_objective,
+        x0=x0,
+        args=(
+            Rhat,
+            init_support_deg,
+            desired_sector,
+            theta_s_bar,
+            sigma_n2_hat,
+            min_sep_deg,
+        ),
+        method="COBYQA",
+        bounds=bounds,
+        options={
+            "maxiter": maxiter,
+            "disp": False,
+        },
+    )
+
+    if res.success:
+        u_opt = res.x
+    else:
+        print(f"[COBYQA] status={res.status}, message={res.message}, fallback to init_support")
+        u_opt = x0
+
+    support_refined = u_to_theta_deg(u_opt)
+
+    # 保险处理
+    support_refined[0] = np.clip(support_refined[0], sec_lo, sec_hi)
+    for k in range(1, len(support_refined)):
+        if sec_lo <= support_refined[k] <= sec_hi:
+            if abs(support_refined[k] - sec_lo) < abs(support_refined[k] - sec_hi):
+                support_refined[k] = sec_lo - 1e-3
+            else:
+                support_refined[k] = sec_hi + 1e-3
+
+    power_refined = solve_power_ls_nonnegative(
+        Rhat=Rhat,
+        support_deg=support_refined,
+        M=M,
+        sigma_n2_hat=sigma_n2_hat,
+        delta=1e-6,
+    )
+
+    return support_refined, power_refined, sigma_n2_hat, res
+def qh_ipnc_beamformer(
+    Rhat,
+    theta_s_bar,
+    desired_sector,
+    grid_deg=None,
+    model_order=None,
+    max_order=6,
+):
+    if grid_deg is None:
+        grid_deg = np.linspace(-90, 90, 721)
+
+    M = Rhat.shape[0]
+    a_bar = steering_vector(theta_s_bar, M)
+
+    spec = qh_pse_spectrum_from_covariance(
+        Rhat=Rhat,
+        model_order=model_order,
+        max_order=max_order,
+        grid_deg=grid_deg,
+        kernel_width_deg=1.2,
+    )
+
+    # 1) 粗选目标和干扰角
+    theta_s0, theta_i0 = select_qh_angles(spec, desired_sector, theta_s_bar, num_interf= spec["model_order"]-1)
+    init_support = np.concatenate([[theta_s0], theta_i0])
+
+    support_refined, power_refined, sigma_n2_hat = refine_qh_angles_nomp(
+        Rhat=Rhat,
+        init_support_deg=init_support,
+        desired_sector=desired_sector,
+        theta_s_bar=theta_s_bar,
+        sigma_n2_hat=spec["sigma_n2_est"],
+        n_outer=2,
+        target_half_width_deg=2.0,
+        interf_half_width_deg=4.0,
+        coarse_step_deg=0.2,
+        newton_steps=2,
+        min_sep_deg=2.0,
+    )
+    # 3) 用精修后的角度/功率重构 Rs、Ri
+    Rs = np.zeros((M, M), dtype=complex)
+    Ri = sigma_n2_hat * np.eye(M, dtype=complex)
+
+    for idx, (th, pw) in enumerate(zip(support_refined, power_refined)):
+        a = steering_vector(th, M)
+        if idx == 0:
+            Rs += pw * (a @ a.conj().T)
+        else:
+            Ri += pw * (a @ a.conj().T)
+
+    Rs = 0.5 * (Rs + Rs.conj().T)
+    Ri = 0.5 * (Ri + Ri.conj().T)
+
+    a_hat = Rs @ a_bar
+    if np.linalg.norm(a_hat) < 1e-12:
+        a_hat = steering_vector(support_refined[0], M)
+    a_hat = normalize_vec(a_hat)
+
+    w = mvdr_weight(Ri, a_hat)
+
+    info = {
+        "theta_init": init_support,
+        "theta_refined": support_refined,
+        "power_refined": power_refined,
+        "sigma_n2_hat": sigma_n2_hat,
+        "spec": spec,
+    }
+    return w, info, Rs, Ri, a_hat
+# ============================================================
+# Sparse-reconstruction INCM
+# ============================================================
+@dataclass
+class SparseInfo:
+    sigma_n2_hat: float
+    support_all_deg: np.ndarray
+    support_interf_deg: np.ndarray
+    powers_all: np.ndarray
+    P_capon: np.ndarray
+    P_sparse: np.ndarray
+
+
+def safe_solve(A, B):
+    try:
+        return np.linalg.solve(A, B)
+    except np.linalg.LinAlgError:
+        return np.linalg.pinv(A) @ B
+
+
+def local_maxima_1d(y):
+    y = np.asarray(y).reshape(-1)
+    peaks = np.zeros_like(y, dtype=bool)
+    if y.size < 3:
+        return peaks
+    peaks[1:-1] = (y[1:-1] > y[:-2]) & (y[1:-1] >= y[2:])
+    return peaks
+
+
+def outer_vec(a):
+    a = np.asarray(a).reshape(-1, 1)
+    return (a @ a.conj().T).reshape(-1, order="F")
+
+
+def solve_power_ls_nonnegative(Rhat, support_deg, M, sigma_n2_hat, delta=1e-5):
+    q = len(support_deg)
+    if q == 0:
+        return np.zeros(0, dtype=float)
+
+    G = np.column_stack([
+        outer_vec(steering_vector(th, M)) for th in support_deg
+    ]).astype(np.complex128)
+
+    r0 = (Rhat - sigma_n2_hat * np.eye(M)).reshape(-1, order="F").astype(np.complex128)
+
+    active = list(range(q))
+    fixed = {}
+
+    while True:
+        if len(active) == 0:
+            break
+
+        r_mod = r0.copy()
+        if fixed:
+            G_fix = np.column_stack([G[:, idx] for idx in fixed.keys()])
+            p_fix = np.array([fixed[idx] for idx in fixed.keys()], dtype=float)
+            r_mod = r_mod - G_fix @ p_fix
+
+        G_act = np.column_stack([G[:, idx] for idx in active])
+        p_act, *_ = np.linalg.lstsq(G_act, r_mod, rcond=None)
+        p_act = p_act.real
+
+        if np.all(p_act >= 0):
+            p = np.zeros(q, dtype=float)
+            for idx, val in fixed.items():
+                p[idx] = val
+            for idx, val in zip(active, p_act):
+                p[idx] = max(float(val), delta)
+            return p
+
+        worst_local = int(np.argmin(p_act))
+        worst_global = active[worst_local]
+        fixed[worst_global] = delta
+        active.pop(worst_local)
+
+    p = np.zeros(q, dtype=float)
+    for idx, val in fixed.items():
+        p[idx] = val
+    return p
+
+
+def sparse_ipnc_beamformer(
+    Rhat,
+    theta_s_bar,
+    desired_sector,
+    grid_deg,
+    delta=1e-5,
+    loading=1e-8,
+):
+    M = Rhat.shape[0]
+    a_bar = steering_vector(theta_s_bar, M)
+
+    Rh = 0.5 * (Rhat + Rhat.conj().T)
+    sigma_n2_hat = max(float(np.min(np.linalg.eigvalsh(Rh)).real), 1e-8)
+
+    # 1) Capon spectrum for support detection
+    P_capon = capon_spectrum(Rhat, grid_deg, loading=1e-3)
+    peak_mask = local_maxima_1d(P_capon)
+
+    sec_lo, sec_hi = desired_sector
+    in_sector = (grid_deg >= sec_lo) & (grid_deg <= sec_hi)
+
+    # 2) desired steering estimate
+    sector_peak_idx = np.where(peak_mask & in_sector & (P_capon > sigma_n2_hat))[0]
+    if sector_peak_idx.size > 0:
+        best_idx = sector_peak_idx[np.argmax(P_capon[sector_peak_idx])]
+        a_hat = steering_vector(grid_deg[best_idx], M)
+    else:
+        a_hat = a_bar.copy()
+
+    # 3) sparse support
+    support_idx = np.where(peak_mask & (P_capon > sigma_n2_hat))[0]
+    support_all_deg = grid_deg[support_idx]
+
+    P_sparse = np.full_like(P_capon, 1e-12, dtype=float)
+
+    if support_all_deg.size == 0:
+        Ri = sigma_n2_hat * np.eye(M, dtype=complex)
+        Rs = a_hat @ a_hat.conj().T
+        a_hat = normalize_vec(a_hat)
+        w = mvdr_weight(Ri, a_hat)
+        info = SparseInfo(
+            sigma_n2_hat=sigma_n2_hat,
+            support_all_deg=np.array([]),
+            support_interf_deg=np.array([]),
+            powers_all=np.array([]),
+            P_capon=P_capon,
+            P_sparse=P_sparse,
+        )
+        return w, info, Rs, Ri, a_hat
+
+    # 4) nonnegative LS power estimation
+    powers_all = solve_power_ls_nonnegative(
+        Rhat=Rhat,
+        support_deg=support_all_deg,
+        M=M,
+        sigma_n2_hat=sigma_n2_hat,
+        delta=delta,
+    )
+
+    for idx, pw in zip(support_idx, powers_all):
+        P_sparse[idx] = max(float(pw), 1e-12)
+
+    # 5) reconstruct Rs and Ri
+    Rs = np.zeros((M, M), dtype=complex)
+    Ri = sigma_n2_hat * np.eye(M, dtype=complex)
+
+    support_interf_deg = []
+    for th, pw in zip(support_all_deg, powers_all):
+        a = steering_vector(th, M)
+        if sec_lo <= th <= sec_hi:
+            Rs += pw * (a @ a.conj().T)
+        else:
+            Ri += pw * (a @ a.conj().T)
+            support_interf_deg.append(float(th))
+
+    Rs = 0.5 * (Rs + Rs.conj().T)
+    Ri = 0.5 * (Ri + Ri.conj().T)
+    Ri += loading * max(np.trace(Ri).real / M, 1e-12) * np.eye(M)
+
+    a_from_Rs = Rs @ a_bar
+    if np.linalg.norm(a_from_Rs) > 1e-12:
+        a_hat = normalize_vec(a_from_Rs)
+    else:
+        a_hat = normalize_vec(a_hat)
+
+    w = mvdr_weight(Ri, a_hat)
+
+    info = SparseInfo(
+        sigma_n2_hat=sigma_n2_hat,
+        support_all_deg=support_all_deg,
+        support_interf_deg=np.array(support_interf_deg),
+        powers_all=powers_all,
+        P_capon=P_capon,
+        P_sparse=P_sparse,
+    )
+    return w, info, Rs, Ri, a_hat
+# ============================================================
+# Baselines
+# ============================================================
+def sample_mvdr_beamformer(Rhat, a_bar):
+    M = Rhat.shape[0]
+    delta = 1e-3 * np.trace(Rhat).real / M
+    Rdl = Rhat + delta * np.eye(M)
+    return mvdr_weight(Rdl, a_bar)
+
+
+def optimal_mvdr_beamformer(Ri_true, a_true):
+    return mvdr_weight(Ri_true, a_true)
+
+
+# ============================================================
+# Plot helpers
+# ============================================================
+def stylize_axes(ax):
+    ax.set_facecolor("white")
+    ax.grid(True, linestyle="-", alpha=GRID_ALPHA)
+    for side in ["top", "right"]:
+        ax.spines[side].set_visible(False)
+    for side in ["left", "bottom"]:
+        ax.spines[side].set_linewidth(1.1)
+    ax.tick_params(direction="out", length=5, width=1.0, pad=6)
+
+
+def plot_single_run_spectra(grid_deg, spectra, meta, desired_sector, qh_theta_est=None):
+    fig, ax = plt.subplots(figsize=(10.6, 5.6))
+
+    # 先画算法曲线
+    for name, P in spectra.items():
+        P = np.asarray(P, dtype=float)
+        P_db = 10.0 * np.log10(P / max(np.max(P), 1e-12) + 1e-12)
+
+        st = METHOD_STYLES[name]
+        ax.plot(
+            grid_deg, P_db,
+            color=st["color"],
+            linestyle="-",
+            linewidth=2.2 if name == "MP-INCM" else 1.8,
+            label=name,
+            zorder=3
+        )
+
+    # 扇区阴影：更淡
+    ax.axvspan(
+        desired_sector[0], desired_sector[1],
+        color=COLORS["sector"], alpha=0.10, zorder=0, label="Desired sector"
+    )
+
+    # 参考线：更细，减少抢戏
+    ax.axvline(meta["theta_s_true"], color=COLORS["true"],
+               linestyle=":", linewidth=1.2, label="True SOI", zorder=2)
+
+    ax.axvline(meta["theta_s_bar"], color=COLORS["presumed"],
+               linestyle="-.", linewidth=1.2, label="Presumed SOI", zorder=2)
+
+    for i, thi in enumerate(meta["theta_i_true"]):
+        ax.axvline(thi, color="0.45", linestyle=":",
+                   linewidth=1.0,
+                   label="True interferer" if i == 0 else None,
+                   zorder=2)
+
+    if qh_theta_est is not None and len(qh_theta_est) > 0:
+        for i, th in enumerate(qh_theta_est):
+            ax.axvline(
+                th, color=COLORS["est"],
+                linestyle=(0, (2, 2)), linewidth=1.0, alpha=0.80,
+                label="MP estimated angle" if i == 0 else None,
+                zorder=2
+            )
+
+    ax.set_xlabel("Angle (deg)")
+    ax.set_ylabel("Normalized spectrum (dB)")
+    ax.set_xlim([-90, 90])
+
+    # 关键改动：主图不要压到 -120
+    ax.set_ylim([-60, 3])
+
+    stylize_axes(ax)
+
+    # 图例移到图外
+    add_box_legend(
+        ax,
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.00),
+        borderaxespad=0.0,
+        ncol=1
+    )
+
+    # -------- inset --------
+    axins = inset_axes(ax, width="31%", height="31%", loc="lower left", borderpad=1.1)
+
+    for name, P in spectra.items():
+        P = np.asarray(P, dtype=float)
+        P_db = 10.0 * np.log10(P / max(np.max(P), 1e-12) + 1e-12)
+        st = METHOD_STYLES[name]
+        axins.plot(
+            grid_deg, P_db,
+            color=st["color"],
+            linestyle="-",
+            linewidth=2.0 if name == "MP-INCM" else 1.6,
+            zorder=3
+        )
+
+    axins.axvspan(
+        desired_sector[0], desired_sector[1],
+        color=COLORS["sector"], alpha=0.10, zorder=0
+    )
+
+    axins.axvline(meta["theta_s_true"], color=COLORS["true"], linestyle=":", linewidth=1.0)
+    axins.axvline(meta["theta_s_bar"], color=COLORS["presumed"], linestyle="-.", linewidth=1.0)
+
+    for thi in meta["theta_i_true"]:
+        axins.axvline(thi, color="0.45", linestyle=":", linewidth=0.9)
+
+    if qh_theta_est is not None and len(qh_theta_est) > 0:
+        for th in qh_theta_est:
+            axins.axvline(th, color=COLORS["est"], linestyle=(0, (2, 2)),
+                          linewidth=0.9, alpha=0.80)
+
+    axins.set_xlim(-4, 13)
+    axins.set_ylim(-35, 3)
+    axins.grid(axis="y", linestyle="-", alpha=0.10)
+    axins.grid(axis="x", visible=False)
+    axins.tick_params(labelsize=9, direction="out", length=3, width=0.7)
+
+    for side in ["top", "right", "left", "bottom"]:
+        axins.spines[side].set_linewidth(0.8)
+        axins.spines[side].set_color("0.4")
+
+    # 放大框和连线改成灰色、细线
+    mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="0.45", lw=0.8)
+
+    fig.tight_layout()
+    plt.subplots_adjust(right=0.80)
+    save_current_figure("fig01_single_run_spectra")
+
+
+def plot_single_run_beampattern(grid_deg, curves, meta):
+    fig, ax = plt.subplots(figsize=(10.6, 5.6))
+
+    key_names = [
+        "Optimal MVDR", "MP-INCM", "Capon-INCM",
+        "MEPS-INCM", "URGLQ-INCM", "PGLQ-INCM", "Sparse-INCM"
+    ]
+
+    for name in key_names:
+        if name not in curves:
+            continue
+        st = METHOD_STYLES[name]
+        ax.plot(
+            grid_deg, curves[name],
+            color=st["color"],
+            linestyle="-",
+            linewidth=2.2 if name == "MP-INCM" else 1.8,
+            label=name,
+            zorder=3
+        )
+
+    ax.axvline(meta["theta_s_true"], color=COLORS["true"],
+               linestyle=":", linewidth=1.2, label="True SOI", zorder=2)
+
+    for i, thi in enumerate(meta["theta_i_true"]):
+        ax.axvline(thi, color="0.45", linestyle=":",
+                   linewidth=1.0,
+                   label="True interferer" if i == 0 else None,
+                   zorder=2)
+
+    ax.set_xlim([-90, 90])
+    ax.set_ylim([-100, 2])
+    ax.set_xlabel("Angle (deg)")
+    ax.set_ylabel("Normalized beampattern (dB)")
+    stylize_axes(ax)
+
+    add_box_legend(
+        ax,
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.00),
+        borderaxespad=0.0
+    )
+
+    # inset
+    x1, x2 = 24, 28.0
+    y1, y2 = -100, -40
+
+    axins = inset_axes(ax, width="30%", height="30%", loc="upper right", borderpad=1.0)
+
+    for name in key_names:
+        if name not in curves:
+            continue
+        st = METHOD_STYLES[name]
+        axins.plot(
+            grid_deg, curves[name],
+            color=st["color"],
+            linestyle="-",
+            linewidth=2.0 if name == "MP-INCM" else 1.5,
+            zorder=3
+        )
+
+    axins.axvline(meta["theta_s_true"], color=COLORS["true"], linestyle=":", linewidth=1.0)
+    for thi in meta["theta_i_true"]:
+        axins.axvline(thi, color="0.45", linestyle=":", linewidth=0.9)
+
+    axins.set_xlim(x1, x2)
+    axins.set_ylim(y1, y2)
+    axins.grid(axis="y", linestyle="-", alpha=0.10)
+    axins.grid(axis="x", visible=False)
+    axins.tick_params(labelsize=9, direction="out", length=3, width=0.7)
+
+    for side in ["top", "right", "left", "bottom"]:
+        axins.spines[side].set_linewidth(0.8)
+        axins.spines[side].set_color("0.4")
+
+    mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="0.45", lw=0.8)
+
+    fig.tight_layout()
+    plt.subplots_adjust(right=0.80)
+    save_current_figure("fig02_single_run_beampattern")
+def plot_curve(
+    x, curves, xlabel, ylabel, title, filename_stem,
+    add_inset=False,
+    inset_xlim=None,
+    inset_ylim=None,
+    inset_loc="center left",
+    inset_width="20%",
+    inset_height="20%",
+    inset_methods=None,
+):
+    fig, ax = plt.subplots(figsize=(10.4, 5.8))
+
+    style_map = {
+        "Optimal MVDR": dict(color=COLORS["optimal"], marker="o", lw=LINEWIDTH_REF),
+        "MP-INCM": dict(color=COLORS["qh"], marker="o", lw=LINEWIDTH_MAIN),
+        "Capon-INCM": dict(color=COLORS["capon"], marker="^", lw=LINEWIDTH_REF),
+        "MEPS-INCM": dict(color=COLORS["meps"], marker="D", lw=LINEWIDTH_REF),
+        "URGLQ-INCM": dict(color=COLORS["urglq"], marker="P", lw=LINEWIDTH_REF),
+        "PGLQ-INCM": dict(color=COLORS["pglq"], marker="X", lw=LINEWIDTH_REF),
+    }
+
+    for name, y in curves.items():
+        plot_method_curve(ax, x, y, name, use_markers=True)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    stylize_axes(ax)
+    if filename_stem == "fig03_sinr_vs_snapshots":
+        add_box_legend(ax, loc="lower right")
+    else:
+        add_box_legend(ax, loc="best")    # ===== inset zoom =====
+    if add_inset and inset_xlim is not None and inset_ylim is not None:
+        axins = inset_axes(
+            ax,
+            width=inset_width,
+            height=inset_height,
+            loc=inset_loc,
+            borderpad=1.1
+        )
+
+        if inset_methods is None:
+            inset_methods = list(curves.keys())
+
+        for name in inset_methods:
+            plot_method_curve(axins, x, curves[name], name, use_markers=True, label=None)
+        axins.set_xlim(inset_xlim)
+        axins.set_ylim(inset_ylim)
+        axins.grid(True, linestyle="-", alpha=0.15)
+        axins.tick_params(labelsize=10, direction="out", length=3, width=0.8)
+
+        for side in ["top", "right", "left", "bottom"]:
+            axins.spines[side].set_linewidth(1.0)
+
+        mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="black", lw=1.0)
+
+    fig.tight_layout()
+    save_current_figure(filename_stem)
+
+# ============================================================
+# Single run
+# ============================================================
+def single_run_demo(
+    M=20,
+    K=50,
+    theta_s_bar=5.0,
+    theta_i_bar=(-30.0, 25.0),   # ← 使用推荐干扰角度
+    desired_half_width=6.0,
+    look_err_deg=3.0,            # ← 使用推荐指向误差
+    snr_db=20.0,
+    inr_db=25.0,                 # ← 使用推荐INR=25dB
+    seed=7,
+):
+    desired_sector = (theta_s_bar - desired_half_width, theta_s_bar + desired_half_width)
+    grid_deg = np.linspace(-90, 90, 3601)
+
+    # 使用完整推荐参数生成数据
+    X, Rhat, a_s_true, a_s_bar, Ri_true, Rs_true, meta = generate_snapshots(
+        M=M,
+        K=K,
+        theta_s_bar=theta_s_bar,
+        theta_i_bar=theta_i_bar,      # -30° 和 25°
+        look_err_deg=look_err_deg,    # 3°
+        snr_db=snr_db,
+        inr_db=inr_db,                # 25dB
+        sigma_n2=1.0,
+        seed=seed,
+    )
+
+    w_opt = optimal_mvdr_beamformer(Ri_true, a_s_true)
+    w_qh, qh_info, Rs_qh, Ri_qh, _ = qh_ipnc_beamformer(
+        Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, model_order=None, max_order=6
+    )
+    spec_qh = qh_info["spec"]
+    w_cap, P_cap, Rs_cap, Ri_cap, _ = capon_ipnc_beamformer(
+        Rhat, theta_s_bar, desired_sector, grid_deg, loading=1e-3
+    )
+    w_meps, meps_info, Rs_meps, Ri_meps, _ = meps_ipnc_beamformer(
+        Rhat, theta_s_bar, desired_sector, alpha=5, S=20, loading=1e-3
+    )
+    theta_i1, theta_i2 = meta["theta_i_true"]
+    ur_intervals = [
+        (theta_i1 - 8.0, theta_i1 + 8.0),
+        (theta_i2 - 8.0, theta_i2 + 8.0),
+    ]
+    w_ur, ur_info, Rs_ur, Ri_ur, _ = urglq_ipnc_beamformer(
+        Rhat,
+        theta_s_bar,
+        desired_sector,
+        interference_intervals=ur_intervals,
+        grid_deg=grid_deg,
+        glq_order=3,
+    )
+    w_pg, pg_info, Rs_pg, Ri_pg, _ = pglq_ipnc_beamformer(
+        Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, Q=3, eig_energy_ratio=0.9, delta_zk_u=0.03
+    )
+    w_sp, sp_info, Rs_sp, Ri_sp, _ = sparse_ipnc_beamformer(
+        Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, delta=1e-5
+    )
+
+    delta = 1e-3 * np.trace(Rhat).real / M
+    Rinv_full = np.linalg.inv(Rhat + delta * np.eye(M))
+    P_meps_full, _, _ = meps_spectrum_from_inverse(Rinv_full, grid_deg, M)
+
+    print("\n================ Single Run ================")
+    print(f"Output folder          : {os.path.abspath(OUTPUT_DIR)}")
+    print(f"True SOI angle         : {meta['theta_s_true']:.3f} deg")
+    print(f"Presumed SOI angle     : {meta['theta_s_bar']:.3f} deg")
+    print(f"True interferers       : {np.round(meta['theta_i_true'], 3)}")
+    print(f"QH auto order          : {spec_qh['model_order']}")
+    print(f"MEPS: L={meps_info['L']}, S={meps_info['S']}")
+    peaks = ur_info.get("peak_angles", None)
+    if peaks is None:
+        print("URGLQ peaks            : None")
+    else:
+        print(f"URGLQ peaks            : {np.round(np.asarray(peaks, dtype=float), 3)}")
+        print(f"PGLQ: L={pg_info['L']}, g={pg_info['g']:.3f}, intervals={pg_info['num_intervals']}")
+    print()
+
+    rows = [
+        ("Optimal MVDR", w_opt, None, None),
+        ("MP-INCM", w_qh, Rs_qh, Ri_qh),
+        ("Capon-INCM", w_cap, Rs_cap, Ri_cap),
+        ("MEPS-INCM", w_meps, Rs_meps, Ri_meps),
+        ("URGLQ-INCM", w_ur, Rs_ur, Ri_ur),
+        ("PGLQ-INCM", w_pg, Rs_pg, Ri_pg),
+        ("Sparse-INCM", w_sp, Rs_sp, Ri_sp),
+    ]
+
+    for name, w, Rs_hat, Ri_hat in rows:
+        sinr = output_sinr_db(w, a_s_true, Ri_true, meta["sigma_s2"])
+        if Rs_hat is None:
+            print(f"{name:15s}: SINR = {sinr:8.3f} dB")
+        else:
+            err_rs = fro_rel_err(Rs_hat, Rs_true)
+            err_ri = fro_rel_err(Ri_hat, Ri_true)
+            print(f"{name:15s}: SINR = {sinr:8.3f} dB | relErr(Rs) = {err_rs:7.4f} | relErr(Ri) = {err_ri:7.4f}")
+
+    spectra = {
+        "MP-INCM": spec_qh["P_grid"],
+        "Capon-INCM": P_cap,
+        "MEPS-INCM": P_meps_full,
+        "URGLQ-INCM": ur_info["P_tilde"],
+        "PGLQ-INCM": pg_info["P_broad"],
+        "Sparse-INCM": sp_info.P_sparse,
+    }
+
+    plot_single_run_spectra(
+        grid_deg,
+        spectra,
+        meta,
+        desired_sector,
+        qh_theta_est=spec_qh["theta_est"],
+    )
+
+    curves = {
+        "Optimal MVDR": beampattern_db(w_opt, M, grid_deg),
+        "MP-INCM": beampattern_db(w_qh, M, grid_deg),
+        "Capon-INCM": beampattern_db(w_cap, M, grid_deg),
+        "MEPS-INCM": beampattern_db(w_meps, M, grid_deg),
+        "URGLQ-INCM": beampattern_db(w_ur, M, grid_deg),
+        "PGLQ-INCM": beampattern_db(w_pg, M, grid_deg),
+        "Sparse-INCM": beampattern_db(w_sp, M, grid_deg),
+    }
+    plot_single_run_beampattern(grid_deg, curves, meta)
+    plt.show()
+
+
+# ============================================================
+# Monte Carlo vs snapshots
+# ============================================================
+def monte_carlo_vs_snapshots(
+    M=20,
+    theta_s_bar=5.0,
+    desired_half_width=6.0,
+    K_list=(20, 30, 40, 50, 60, 70, 80, 90, 100),
+    MC=100,
+):
+    desired_sector = (theta_s_bar - desired_half_width, theta_s_bar + desired_half_width)
+    grid_deg = np.linspace(-90, 90, 721)
+
+    method_names = ["Optimal MVDR", "MP-INCM", "Capon-INCM", "MEPS-INCM", "URGLQ-INCM", "PGLQ-INCM",
+                    "Sparse-INCM"]
+    sinr_curves = {k: [] for k in method_names}
+    errRi_curves = {"MP-INCM": [], "Capon-INCM": [], "MEPS-INCM": [], "URGLQ-INCM": [], "PGLQ-INCM": [],
+                    "Sparse-INCM": []}
+    errRs_curves = {"MP-INCM": [], "Capon-INCM": [], "MEPS-INCM": [], "URGLQ-INCM": [], "PGLQ-INCM": [],
+                    "Sparse-INCM": []}
+    for K in K_list:
+        rec_sinr = {k: [] for k in method_names}
+        rec_errRi = {k: [] for k in errRi_curves}
+        rec_errRs = {k: [] for k in errRs_curves}
+
+        for mc in range(MC):
+            X, Rhat, a_s_true, a_s_bar, Ri_true, Rs_true, meta = generate_snapshots(
+                M=M, K=K,
+                theta_s_bar=theta_s_bar,
+                theta_i_bar=(-30.0, 25.0),
+                look_err_deg=3.0,
+                snr_db=20.0,
+                inr_db=25.0,
+                sigma_n2=1.0,
+                seed=1000 * mc + K,
+            )
+
+            w_opt = optimal_mvdr_beamformer(Ri_true, a_s_true)
+            w_scm = sample_mvdr_beamformer(Rhat, a_s_bar)
+            w_qh, _, Rs_qh, Ri_qh, _ = qh_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, model_order=None, max_order=6
+            )
+            w_cap, _, Rs_cap, Ri_cap, _ = capon_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, grid_deg, loading=1e-3
+            )
+            w_meps, _, Rs_meps, Ri_meps, _ = meps_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, alpha=5, S=20, loading=1e-3
+            )
+            theta_i1, theta_i2 = meta["theta_i_true"]
+            ur_intervals = [
+                (theta_i1 - 8.0, theta_i1 + 8.0),
+                (theta_i2 - 8.0, theta_i2 + 8.0),
+            ]
+            w_ur, ur_info, Rs_ur, Ri_ur, _ = urglq_ipnc_beamformer(
+                Rhat,
+                theta_s_bar,
+                desired_sector,
+                interference_intervals=ur_intervals,
+                grid_deg=grid_deg,
+                glq_order=3,
+            )
+            w_pg, _, Rs_pg, Ri_pg, _ = pglq_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, Q=3, eig_energy_ratio=0.9, delta_zk_u=0.03
+            )
+            w_sp, _, Rs_sp, Ri_sp, _ = sparse_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, delta=1e-5
+            )
+            rec_sinr["Optimal MVDR"].append(output_sinr_db(w_opt, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["MP-INCM"].append(output_sinr_db(w_qh, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["Capon-INCM"].append(output_sinr_db(w_cap, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["MEPS-INCM"].append(output_sinr_db(w_meps, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["URGLQ-INCM"].append(output_sinr_db(w_ur, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["PGLQ-INCM"].append(output_sinr_db(w_pg, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["Sparse-INCM"].append(output_sinr_db(w_sp, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_errRi["Sparse-INCM"].append(fro_rel_err(Ri_sp, Ri_true))
+            rec_errRs["Sparse-INCM"].append(fro_rel_err(Rs_sp, Rs_true))
+
+            rec_errRi["MP-INCM"].append(fro_rel_err(Ri_qh, Ri_true))
+            rec_errRi["Capon-INCM"].append(fro_rel_err(Ri_cap, Ri_true))
+            rec_errRi["MEPS-INCM"].append(fro_rel_err(Ri_meps, Ri_true))
+            rec_errRi["URGLQ-INCM"].append(fro_rel_err(Ri_ur, Ri_true))
+            rec_errRi["PGLQ-INCM"].append(fro_rel_err(Ri_pg, Ri_true))
+
+            rec_errRs["MP-INCM"].append(fro_rel_err(Rs_qh, Rs_true))
+            rec_errRs["Capon-INCM"].append(fro_rel_err(Rs_cap, Rs_true))
+            rec_errRs["MEPS-INCM"].append(fro_rel_err(Rs_meps, Rs_true))
+            rec_errRs["URGLQ-INCM"].append(fro_rel_err(Rs_ur, Rs_true))
+            rec_errRs["PGLQ-INCM"].append(fro_rel_err(Rs_pg, Rs_true))
+
+        for k in method_names:
+            sinr_curves[k].append(np.mean(rec_sinr[k]))
+        for k in errRi_curves:
+            errRi_curves[k].append(np.mean(rec_errRi[k]))
+            errRs_curves[k].append(np.mean(rec_errRs[k]))
+
+    plot_curve(
+        K_list, sinr_curves,
+        xlabel="Number of snapshots",
+        ylabel="Average output SINR (dB)",
+        title="Output SINR versus Number of Snapshots",
+        filename_stem="fig03_sinr_vs_snapshots",
+    )
+
+    plot_curve(
+        K_list, errRi_curves,
+        xlabel="Number of snapshots",
+        ylabel=r"Average relative error of $\hat{\mathbf{R}}_{i+n}$",
+        title=r"Reconstruction Error of $\hat{\mathbf{R}}_{i+n}$ versus Number of Snapshots",
+        filename_stem="fig04_Rin_error_vs_snapshots",
+        add_inset=True,
+        inset_xlim=(25, 30),
+        inset_ylim=(0.985, 1.005),
+        inset_loc="center left",
+        inset_methods=["Capon-INCM", "URGLQ-INCM", "PGLQ-INCM", "MEPS-INCM"]
+    )
+
+    plot_curve(
+        K_list, errRs_curves,
+        xlabel="Number of snapshots",
+        ylabel=r"Average relative error of $\hat{\mathbf{R}}_{s}$",
+        title=r"Reconstruction Error of $\hat{\mathbf{R}}_{s}$ versus Number of Snapshots",
+        filename_stem="fig05_Rs_error_vs_snapshots",
+        add_inset=True,
+        inset_xlim=(25, 30),
+        inset_ylim=(0.988, 1.002),
+        inset_loc="upper left",
+        inset_methods=["Capon-INCM", "URGLQ-INCM", "PGLQ-INCM", "MEPS-INCM"]
+    )
+
+    plt.show()
+    return sinr_curves, errRi_curves, errRs_curves
+# ============================================================
+# Runtime plot helpers
+# ============================================================
+def plot_runtime_curve(x, curves, xlabel, ylabel, filename_stem, logy=False):
+    fig, ax = plt.subplots(figsize=(10.4, 5.8))
+
+    style_map = {
+        "MP-INCM": dict(color=COLORS["qh"], marker="o", lw=LINEWIDTH_MAIN),
+        "Capon-INCM": dict(color=COLORS["capon"], marker="^", lw=LINEWIDTH_REF),
+        "MEPS-INCM": dict(color=COLORS["meps"], marker="D", lw=LINEWIDTH_REF),
+        "URGLQ-INCM": dict(color=COLORS["urglq"], marker="P", lw=LINEWIDTH_REF),
+        "PGLQ-INCM": dict(color=COLORS["pglq"], marker="X", lw=LINEWIDTH_REF),
+        "Sparse-INCM": dict(color=COLORS["sparse"], marker="v", lw=LINEWIDTH_REF),  # ← 新增这一行
+    }
+
+    for name, y in curves.items():
+        style = style_map.get(name, dict(color=None, marker="o", lw=LINEWIDTH_REF))
+        ax.plot(
+            x, y,
+            marker=style["marker"],
+            linewidth=style["lw"],
+            markersize=MARKERSIZE,
+            color=style["color"],
+            label=name
+        )
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if logy:
+        ax.set_yscale("log")
+
+    stylize_axes(ax)
+    add_box_legend(ax, loc="best")
+    fig.tight_layout()
+    save_current_figure(filename_stem)
+
+
+def measure_runtime_ms(func, n_repeat=3, warmup=True):
+    if warmup:
+        _ = func()
+
+    t0 = time.perf_counter()
+    for _ in range(n_repeat):
+        _ = func()
+    t1 = time.perf_counter()
+
+    return 1000.0 * (t1 - t0) / n_repeat
+
+
+# ============================================================
+# Monte Carlo runtime vs snapshots
+# ============================================================
+def monte_carlo_runtime_vs_snapshots(
+    M=20,
+    theta_s_bar=5.0,
+    desired_half_width=6.0,
+    K_list=(20, 30, 40, 50, 60, 70, 80, 90, 100),
+    MC=100,
+    n_repeat=3,
+    grid_size=721,
+):
+    desired_sector = (theta_s_bar - desired_half_width, theta_s_bar + desired_half_width)
+    grid_deg = np.linspace(-90, 90, grid_size)
+
+    method_names = [ "MP-INCM", "Capon-INCM", "MEPS-INCM", "URGLQ-INCM", "PGLQ-INCM", "Sparse-INCM"]
+    runtime_curves = {k: [] for k in method_names}
+
+    for K in K_list:
+        rec_runtime = {k: [] for k in method_names}
+
+        for mc in range(MC):
+            X, Rhat, a_s_true, a_s_bar, Ri_true, Rs_true, meta = generate_snapshots(
+                M=M, K=K,
+                theta_s_bar=theta_s_bar,
+                theta_i_bar=(-30.0, 25.0),
+                look_err_deg=3.0,
+                snr_db=20.0,
+                inr_db=25.0,
+                sigma_n2=1.0,
+                seed=3000 * mc + K,
+            )
+
+            method_funcs = {
+                "MP-INCM": lambda: qh_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector,
+                    grid_deg=grid_deg, model_order=None, max_order=6
+                ),
+                "Capon-INCM": lambda: capon_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector, grid_deg, loading=1e-3
+                ),
+                "Sparse-INCM": lambda: sparse_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, delta=1e-5
+                ),
+                "MEPS-INCM": lambda: meps_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector, alpha=5, S=20, loading=1e-3
+                ),
+                "URGLQ-INCM": lambda: urglq_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector,
+                    grid_deg=grid_deg, num_interferers=2,
+                    interference_half_width_deg=8.0, glq_order=3
+                ),
+                "PGLQ-INCM": lambda: pglq_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector,
+                    grid_deg=grid_deg, Q=3,
+                    eig_energy_ratio=0.9, delta_zk_u=0.03
+                ),
+            }
+
+            for name, fn in method_funcs.items():
+                rec_runtime[name].append(measure_runtime_ms(fn, n_repeat=n_repeat, warmup=True))
+
+        for k in method_names:
+            runtime_curves[k].append(np.mean(rec_runtime[k]))
+
+    plot_runtime_curve(
+        K_list, runtime_curves,
+        xlabel="Number of snapshots",
+        ylabel="Average runtime (ms)",
+        filename_stem="fig09_runtime_vs_snapshots",
+        logy=False
+    )
+
+    plot_runtime_curve(
+        K_list, runtime_curves,
+        xlabel="Number of snapshots",
+        ylabel="Average runtime (ms, log scale)",
+        filename_stem="fig10_runtime_vs_snapshots_log",
+        logy=True
+    )
+
+    plt.show()
+    return runtime_curves
+
+
+# ============================================================
+# Monte Carlo runtime vs number of sensors
+# ============================================================
+def monte_carlo_runtime_vs_sensors(
+    M_list=(10, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100),
+    K=50,
+    theta_s_bar=5.0,
+    desired_half_width=6.0,
+    MC=100,
+    n_repeat=3,
+    grid_size=721,
+):
+    desired_sector = (theta_s_bar - desired_half_width, theta_s_bar + desired_half_width)
+    # 其余代码不变
+    grid_deg = np.linspace(-90, 90, grid_size)
+
+    method_names = [ "MP-INCM", "Capon-INCM", "MEPS-INCM", "URGLQ-INCM", "PGLQ-INCM", "Sparse-INCM"]
+    runtime_curves = {k: [] for k in method_names}
+
+    for M in M_list:
+        rec_runtime = {k: [] for k in method_names}
+
+        for mc in range(MC):
+            X, Rhat, a_s_true, a_s_bar, Ri_true, Rs_true, meta = generate_snapshots(
+                M=M, K=K,
+                theta_s_bar=theta_s_bar,
+                theta_i_bar=(-30.0, 25.0),
+                look_err_deg=3.0,
+                snr_db=20.0,
+                inr_db=25.0,
+                sigma_n2=1.0,
+                seed=4000 * mc + M,
+            )
+
+            method_funcs = {
+                "MP-INCM": lambda: qh_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector,
+                    grid_deg=grid_deg, model_order=None, max_order=6
+                ),
+                "Capon-INCM": lambda: capon_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector, grid_deg, loading=1e-3
+                ),
+                "MEPS-INCM": lambda: meps_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector, alpha=5, S=20, loading=1e-3
+                ),
+                "Sparse-INCM": lambda: sparse_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, delta=1e-5
+                ),
+                "URGLQ-INCM": lambda: urglq_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector,
+                    grid_deg=grid_deg, num_interferers=2,
+                    interference_half_width_deg=8.0, glq_order=3
+                ),
+                "PGLQ-INCM": lambda: pglq_ipnc_beamformer(
+                    Rhat, theta_s_bar, desired_sector,
+                    grid_deg=grid_deg, Q=3,
+                    eig_energy_ratio=0.9, delta_zk_u=0.03
+                ),
+            }
+
+            for name, fn in method_funcs.items():
+                rec_runtime[name].append(measure_runtime_ms(fn, n_repeat=n_repeat, warmup=True))
+
+        for k in method_names:
+            runtime_curves[k].append(np.mean(rec_runtime[k]))
+
+    plot_runtime_curve(
+        M_list, runtime_curves,
+        xlabel="Number of sensors",
+        ylabel="Average runtime (ms)",
+        filename_stem="fig11_runtime_vs_sensors",
+        logy=False
+    )
+
+    plot_runtime_curve(
+        M_list, runtime_curves,
+        xlabel="Number of sensors",
+        ylabel="Average runtime (ms, log scale)",
+        filename_stem="fig12_runtime_vs_sensors_log",
+        logy=True
+    )
+
+    plt.show()
+    return runtime_curves
+# ============================================================
+# Monte Carlo vs mismatch
+# ============================================================
+def monte_carlo_vs_look_error(
+    M=20,
+    K=50,
+    theta_s_bar=5.0,
+    desired_half_width=6.0,
+    err_list=(0, 2, 4, 6, 8, 10, 12),
+    MC=100,
+):
+    desired_sector = (theta_s_bar - desired_half_width, theta_s_bar + desired_half_width)
+    # 其余代码不变
+    grid_deg = np.linspace(-90, 90, 721)
+
+    method_names = ["Optimal MVDR", "MP-INCM", "Capon-INCM", "MEPS-INCM", "URGLQ-INCM", "PGLQ-INCM",
+                    "Sparse-INCM"]
+    sinr_curves = {k: [] for k in method_names}
+    errRi_curves = {"MP-INCM": [], "Capon-INCM": [], "MEPS-INCM": [], "URGLQ-INCM": [], "PGLQ-INCM": [],
+                    "Sparse-INCM": []}
+    errRs_curves = {"MP-INCM": [], "Capon-INCM": [], "MEPS-INCM": [], "URGLQ-INCM": [], "PGLQ-INCM": [],
+                    "Sparse-INCM": []}
+    for err in err_list:
+        rec_sinr = {k: [] for k in method_names}
+        rec_errRi = {k: [] for k in errRi_curves}
+        rec_errRs = {k: [] for k in errRs_curves}
+
+        for mc in range(MC):
+            X, Rhat, a_s_true, a_s_bar, Ri_true, Rs_true, meta = generate_snapshots(
+                M=M, K=K,
+                theta_s_bar=theta_s_bar,
+                theta_i_bar=(-30.0, 25.0),  # ← 已统一
+                look_err_deg=err,  # 这里保留 err（这是 vs look error 的变量）
+                snr_db=20.0,
+                inr_db=25.0,  # ← 已统一
+                sigma_n2=1.0,
+                seed=2000 * mc + int(10 * err + K),
+            )
+
+            w_opt = optimal_mvdr_beamformer(Ri_true, a_s_true)
+            w_scm = sample_mvdr_beamformer(Rhat, a_s_bar)
+            w_qh, _, Rs_qh, Ri_qh, _ = qh_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, model_order=None, max_order=6
+            )
+            w_cap, _, Rs_cap, Ri_cap, _ = capon_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, grid_deg, loading=1e-3
+            )
+            w_meps, _, Rs_meps, Ri_meps, _ = meps_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, alpha=5, S=20, loading=1e-3
+            )
+            theta_i1, theta_i2 = meta["theta_i_true"]
+            ur_intervals = [
+                (theta_i1 - 8.0, theta_i1 + 8.0),
+                (theta_i2 - 8.0, theta_i2 + 8.0),
+            ]
+            w_ur, ur_info, Rs_ur, Ri_ur, _ = urglq_ipnc_beamformer(
+                Rhat,
+                theta_s_bar,
+                desired_sector,
+                interference_intervals=ur_intervals,
+                grid_deg=grid_deg,
+                glq_order=3,
+            )
+            w_pg, _, Rs_pg, Ri_pg, _ = pglq_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, Q=3, eig_energy_ratio=0.9, delta_zk_u=0.03
+            )
+            w_sp, _, Rs_sp, Ri_sp, _ = sparse_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, grid_deg=grid_deg, delta=1e-5
+            )
+
+            rec_sinr["Sparse-INCM"].append(output_sinr_db(w_sp, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_errRi["Sparse-INCM"].append(fro_rel_err(Ri_sp, Ri_true))
+            rec_errRs["Sparse-INCM"].append(fro_rel_err(Rs_sp, Rs_true))
+            rec_sinr["Optimal MVDR"].append(output_sinr_db(w_opt, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["MP-INCM"].append(output_sinr_db(w_qh, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["Capon-INCM"].append(output_sinr_db(w_cap, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["MEPS-INCM"].append(output_sinr_db(w_meps, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["URGLQ-INCM"].append(output_sinr_db(w_ur, a_s_true, Ri_true, meta["sigma_s2"]))
+            rec_sinr["PGLQ-INCM"].append(output_sinr_db(w_pg, a_s_true, Ri_true, meta["sigma_s2"]))
+
+            rec_errRi["MP-INCM"].append(fro_rel_err(Ri_qh, Ri_true))
+            rec_errRi["Capon-INCM"].append(fro_rel_err(Ri_cap, Ri_true))
+            rec_errRi["MEPS-INCM"].append(fro_rel_err(Ri_meps, Ri_true))
+            rec_errRi["URGLQ-INCM"].append(fro_rel_err(Ri_ur, Ri_true))
+            rec_errRi["PGLQ-INCM"].append(fro_rel_err(Ri_pg, Ri_true))
+
+            rec_errRs["MP-INCM"].append(fro_rel_err(Rs_qh, Rs_true))
+            rec_errRs["Capon-INCM"].append(fro_rel_err(Rs_cap, Rs_true))
+            rec_errRs["MEPS-INCM"].append(fro_rel_err(Rs_meps, Rs_true))
+            rec_errRs["URGLQ-INCM"].append(fro_rel_err(Rs_ur, Rs_true))
+            rec_errRs["PGLQ-INCM"].append(fro_rel_err(Rs_pg, Rs_true))
+
+        for k in method_names:
+            sinr_curves[k].append(np.mean(rec_sinr[k]))
+        for k in errRi_curves:
+            errRi_curves[k].append(np.mean(rec_errRi[k]))
+            errRs_curves[k].append(np.mean(rec_errRs[k]))
+
+    plot_curve(
+        err_list, sinr_curves,
+        xlabel="Look-direction mismatch range (deg)",
+        ylabel="Average output SINR (dB)",
+        title="Output SINR versus Look-Direction Mismatch Range",
+        add_inset=True,  # 打开放大镜
+        inset_xlim=(0, 4),  # 横轴放大范围（可自行调整）
+        inset_ylim=(30, 34),  # 纵轴放大范围（可自行调整）
+        inset_loc="lower center",  # 放大镜位置（可改：lower right / center right 等）
+        inset_width="26%",  # 放大镜宽度
+        inset_height="26%",  # 放大镜高度
+        inset_methods=None,  # None = 显示所有曲线（推荐）
+        filename_stem="fig06_sinr_vs_mismatch"
+    )
+
+    plot_curve(
+        err_list, errRi_curves,
+        xlabel="Look-direction mismatch range (deg)",
+        ylabel=r"Average relative error of $\hat{\mathbf{R}}_{i+n}$",
+        title=r"Reconstruction Error of $\hat{\mathbf{R}}_{i+n}$ versus Mismatch Range",
+        filename_stem="fig07_Rin_error_vs_mismatch",
+        add_inset=True,
+        inset_xlim=(0, 12),
+        inset_ylim=(0.988, 1.002),
+        inset_loc="lower left",
+        inset_methods=["Capon-INCM", "URGLQ-INCM", "PGLQ-INCM"]
+    )
+
+    plot_curve(
+        err_list, errRs_curves,
+        xlabel="Look-direction mismatch range (deg)",
+        ylabel=r"Average relative error of $\hat{\mathbf{R}}_{s}$",
+        title=r"Reconstruction Error of $\hat{\mathbf{R}}_{s}$ versus Mismatch Range",
+        filename_stem="fig08_Rs_error_vs_mismatch"
+    )
+
+    plt.show()
+    return sinr_curves, errRi_curves, errRs_curves
+def greedy_match_atoms(est_angles, est_powers, true_angles):
+    est_angles = np.asarray(est_angles, dtype=float).reshape(-1)
+    est_powers = np.asarray(est_powers, dtype=float).reshape(-1)
+    true_angles = np.asarray(true_angles, dtype=float).reshape(-1)
+
+    matched_angles = np.zeros_like(true_angles, dtype=float)
+    matched_powers = np.zeros_like(true_angles, dtype=float)
+
+    used = np.zeros(len(est_angles), dtype=bool)
+
+    for k, th_true in enumerate(true_angles):
+        avail = np.where(~used)[0]
+        if avail.size == 0:
+            matched_angles[k] = th_true
+            matched_powers[k] = 1e-12
+            continue
+
+        j = avail[np.argmin(np.abs(est_angles[avail] - th_true))]
+        used[j] = True
+        matched_angles[k] = est_angles[j]
+        matched_powers[k] = max(float(est_powers[j]), 1e-12)
+
+    return matched_angles, matched_powers
+
+
+def extract_qh_matched_atoms(spec_qh, meta, desired_sector):
+    theta_est = np.asarray(spec_qh["theta_est"], dtype=float)
+    power_est = np.asarray(spec_qh["power_est"], dtype=float)
+
+    in_sector = (theta_est >= desired_sector[0]) & (theta_est <= desired_sector[1])
+
+    # 目标
+    theta_s_est, p_s_est = greedy_match_atoms(
+        theta_est[in_sector],
+        power_est[in_sector],
+        np.array([meta["theta_s_true"]], dtype=float)
+    )
+
+    # 干扰
+    theta_i_est, p_i_est = greedy_match_atoms(
+        theta_est[~in_sector],
+        power_est[~in_sector],
+        np.asarray(meta["theta_i_true"], dtype=float)
+    )
+
+    return float(theta_s_est[0]), float(p_s_est[0]), theta_i_est, p_i_est
+
+
+def build_beamformer_from_atoms(
+    M,
+    theta_s_bar,
+    theta_s_atom,
+    p_s_atom,
+    theta_i_atoms,
+    p_i_atoms,
+    sigma_n2,
+):
+    a_bar = steering_vector(theta_s_bar, M)
+
+    a_s = steering_vector(theta_s_atom, M)
+    Rs = float(p_s_atom) * (a_s @ a_s.conj().T)
+
+    Ri = float(sigma_n2) * np.eye(M, dtype=complex)
+    for th, pw in zip(np.asarray(theta_i_atoms).reshape(-1), np.asarray(p_i_atoms).reshape(-1)):
+        a_i = steering_vector(th, M)
+        Ri += float(pw) * (a_i @ a_i.conj().T)
+
+    Rs = 0.5 * (Rs + Rs.conj().T)
+    Ri = 0.5 * (Ri + Ri.conj().T)
+
+    a_hat = Rs @ a_bar
+    if np.linalg.norm(a_hat) < 1e-12:
+        a_hat = a_bar.copy()
+    a_hat = normalize_vec(a_hat)
+
+    w = mvdr_weight(Ri, a_hat)
+    return w, Rs, Ri, a_hat
+
+
+def monte_carlo_vs_input_snr(
+        M=20,
+        K=50,
+        theta_s_bar=5.0,  # ← 统一
+        theta_i_bar=(-30.0, 25.0),  # ← 统一
+        desired_half_width=6.0,
+        snr_list=(-5, 0, 5, 10, 15, 20),
+        inr_db=25.0,  # ← 统一
+        sigma_n2=1.0,
+        look_err_deg=3.0,  # ← 统一
+        MC=100,
+        mismatch_type="look",
+):
+    desired_sector = (theta_s_bar - desired_half_width, theta_s_bar + desired_half_width)
+    grid_deg = np.linspace(-90.0, 90.0, 721)
+
+    # === 只保留这几个方法（删掉了两条 ablation 曲线）===
+    method_names = [
+        "Optimal MVDR",
+        "MP-INCM",
+        "Capon-INCM",
+        "MEPS-INCM",
+        "URGLQ-INCM",
+        "PGLQ-INCM",
+        "Sparse-INCM",
+    ]
+    sinr_curves = {name: [] for name in method_names}
+
+    for snr_db in snr_list:
+        rec_sinr = {name: [] for name in method_names}
+
+        for mc in range(MC):
+            X, Rhat, a_s_true, a_s_bar, Ri_true, Rs_true, meta = generate_snapshots(
+                M=M,
+                K=K,
+                theta_s_bar=theta_s_bar,
+                theta_i_bar=theta_i_bar,
+                look_err_deg=look_err_deg,
+                snr_db=snr_db,
+                inr_db=inr_db,
+                sigma_n2=sigma_n2,
+                seed=1000 * mc + int(10 * (snr_db + 50)),
+                mismatch_type=mismatch_type,
+            )
+
+            w_opt = optimal_mvdr_beamformer(Ri_true, a_s_true)
+
+            # 只计算真实的 MP-INCM（不需要 ablation）
+            w_qh, _, _, _, _ = qh_ipnc_beamformer(
+                Rhat,
+                theta_s_bar,
+                desired_sector,
+                grid_deg=grid_deg,
+                model_order=None,
+                max_order=6,
+            )
+
+            w_cap, _, _, _, _ = capon_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, grid_deg, loading=1e-3
+            )
+            w_meps, _, _, _, _ = meps_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector, alpha=5, S=20, loading=1e-3
+            )
+
+            theta_i1, theta_i2 = meta["theta_i_true"]
+            ur_intervals = [
+                (theta_i1 - 8.0, theta_i1 + 8.0),
+                (theta_i2 - 8.0, theta_i2 + 8.0),
+            ]
+            w_ur, _, _, _, _ = urglq_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector,
+                interference_intervals=ur_intervals,
+                grid_deg=grid_deg, glq_order=3
+            )
+
+            w_pg, _, _, _, _ = pglq_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector,
+                grid_deg=grid_deg, Q=3,
+                eig_energy_ratio=0.9, delta_zk_u=0.03
+            )
+
+            w_sp, _, _, _, _ = sparse_ipnc_beamformer(
+                Rhat, theta_s_bar, desired_sector,
+                grid_deg=grid_deg, delta=1e-5
+            )
+
+            # 记录 SINR（不再记录两条 ablation 曲线）
+            rec_sinr["Optimal MVDR"].append(
+                output_sinr_db(w_opt, a_s_true, Ri_true, meta["sigma_s2"])
+            )
+            rec_sinr["MP-INCM"].append(
+                output_sinr_db(w_qh, a_s_true, Ri_true, meta["sigma_s2"])
+            )
+            rec_sinr["Capon-INCM"].append(
+                output_sinr_db(w_cap, a_s_true, Ri_true, meta["sigma_s2"])
+            )
+            rec_sinr["MEPS-INCM"].append(
+                output_sinr_db(w_meps, a_s_true, Ri_true, meta["sigma_s2"])
+            )
+            rec_sinr["URGLQ-INCM"].append(
+                output_sinr_db(w_ur, a_s_true, Ri_true, meta["sigma_s2"])
+            )
+            rec_sinr["PGLQ-INCM"].append(
+                output_sinr_db(w_pg, a_s_true, Ri_true, meta["sigma_s2"])
+            )
+            rec_sinr["Sparse-INCM"].append(
+                output_sinr_db(w_sp, a_s_true, Ri_true, meta["sigma_s2"])
+            )
+
+        for name in method_names:
+            sinr_curves[name].append(np.mean(rec_sinr[name]))
+
+    # 画图（现在只会显示 7 条曲线）
+    # ==================== 画图（新增放大镜） ====================
+    plot_curve(
+        snr_list,
+        sinr_curves,
+        xlabel="Input SNR (dB)",
+        ylabel="Average output SINR (dB)",
+        title="Output SINR versus Input SNR",
+        filename_stem="fig_sinr_vs_input_snr",
+
+        # ==================== 新增：放大镜参数 ====================
+        add_inset=True,  # 打开放大镜
+        inset_xlim=(4.2, 5.2),  # 横轴放大范围（可自行调整）
+        inset_ylim=(14, 19),  # 纵轴放大范围（可自行调整）
+        inset_loc="lower right",  # 放大镜位置（可改：lower right / center right 等）
+        inset_width="32%",  # 放大镜宽度
+        inset_height="32%",  # 放大镜高度
+        inset_methods=None  # None = 显示所有曲线（推荐）
+    )
+    return sinr_curves
+if __name__ == "__main__":
+    ensure_output_dir()
+    # monte_carlo_vs_input_snr(
+    #     M=20,  # 文献中最常用的阵元数（20比30更标准）
+    #     K=50,  # 快拍数适中，既能看出低快拍优势，又不计算太慢
+    #     theta_s_bar=5.0,  # SOI 方向
+    #     theta_i_bar=(-30.0, 25.0),  # 干扰角度拉得更开，更具代表性
+    #     desired_half_width=6.0,  # 期望扇区半宽（6° 很合理）
+    #     snr_list=(-5, 0, 5, 10, 15, 20),
+    #     inr_db=25.0,  # 干扰强度提升到25dB（15dB太弱了，算法差异不明显）
+    #     sigma_n2=1.0,
+    #     look_err_deg=3.0,  # 指向误差3°（比4°稍小，但仍能体现鲁棒性）
+    #     MC=100,
+    #     mismatch_type="look",
+    # )
+    single_run_demo(seed=7)  # 使用统一参数
+
+    # monte_carlo_vs_snapshots(MC=100)  # 可适当减小MC以节省时间
+    # monte_carlo_vs_look_error(MC=100)
+    # monte_carlo_runtime_vs_snapshots(MC=100)  # 时间测试建议MC小一点
+    # monte_carlo_runtime_vs_sensors(MC=20)
+
+    print("\nAll figures have been saved to:")
+    print(os.path.abspath(OUTPUT_DIR))
