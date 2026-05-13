@@ -8,6 +8,15 @@ The codes are organized into two main folders:
 
 These codes are associated with ongoing research on robust adaptive beamforming. The related manuscripts are currently **under peer review**.
 
+
+## Citation Notice
+
+The related manuscripts are currently **under peer review**, and the formal citation information is not yet available.
+
+**Any form of citation, reference, or academic use of this work must be made only after contacting the author in advance.**
+
+If you would like to cite this work, reproduce the results, or build upon the provided codes, please **contact the author before citation** to obtain the latest manuscript information and the recommended citation format.
+
 ## Repository Structure
 
 ```text
@@ -20,10 +29,4 @@ These codes are associated with ongoing research on robust adaptive beamforming.
 │
 └── README.md
 
-## Citation Notice
 
-The related manuscripts are currently **under peer review**, and the formal citation information is not yet available.
-
-**Any form of citation, reference, or academic use of this work must be made only after contacting the author in advance.**
-
-If you would like to cite this work, reproduce the results, or build upon the provided codes, please **contact the author before citation** to obtain the latest manuscript information and the recommended citation format.
